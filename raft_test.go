@@ -947,8 +947,21 @@ func TestRaft_SnapshotRestore(t *testing.T) {
 	snap := snaps[0]
 
 	// Logs should be trimmed
-	if idx, _ := leader.logs.FirstIndex(); idx != snap.Index-conf.TrailingLogs+1 {
-		c.FailNowf("should trim logs to %d: but is %d", snap.Index-conf.TrailingLogs+1, idx)
+	li, _ := leader.logs.LastIndex()
+	t.Log("Actual Log Index: ", li)
+	t.Log("Checkpoint index: ", snap.Index)
+	expectedIdx := snap.Index - conf.TrailingLogs + 1
+
+	if idx, _ := leader.logs.FirstIndex(); idx != expectedIdx {
+		f, _ := leader.logs.FirstIndex()
+		l, _ := leader.logs.LastIndex()
+
+		t.Log("LogFirst:", f)
+		t.Log("LogLast:", l)
+
+		t.Log("E:", expectedIdx)
+		t.Log("I:", idx)
+		c.FailNowf("should trim logs to %d: but is %d", expectedIdx, idx)
 	}
 
 	// Shutdown
@@ -958,6 +971,82 @@ func TestRaft_SnapshotRestore(t *testing.T) {
 	}
 
 	// Restart the Raft
+	r := leader
+	// Can't just reuse the old transport as it will be closed
+	_, trans2 := NewInmemTransport(r.trans.LocalAddr())
+	r, err := NewRaft(&r.conf, r.fsm, r.logs, r.stable, r.snapshots, trans2)
+	if err != nil {
+		c.FailNowf("err: %v", err)
+	}
+	c.rafts[0] = r
+
+	// We should have restored from the snapshot!
+	if last := r.getLastApplied(); last != snap.Index {
+		c.FailNowf("bad last index: %d, expecting %d", last, snap.Index)
+	}
+}
+
+func TestRaft_SnapshotTrailingFullLog(t *testing.T) {
+	// Make the cluster
+	conf := inmemConfig(t)
+	// Don't keep any log entries after snapshot
+	conf.TrailingLogs = 0
+	c := MakeCluster(1, t, conf)
+	defer c.Close()
+
+	// Commit a lot of things
+	leader := c.Leader()
+	var future Future
+	for i := 0; i < 100; i++ {
+		future = leader.Apply([]byte(fmt.Sprintf("test%d", i)), 0)
+	}
+
+	// Wait for the last future to apply
+	if err := future.Error(); err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	// Take a snapshot
+	snapFuture := leader.Snapshot()
+	if err := snapFuture.Error(); err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	// Check for snapshot
+	snaps, _ := leader.snapshots.List()
+	if len(snaps) != 1 {
+		t.Fatalf("should have a snapshot")
+	}
+	snap := snaps[0]
+	t.Log(conf.TrailingLogs)
+
+	// Logs should be entirely trimmed. In this case, the expected
+	// log idx after snapshot creation must be the actual last indx
+	// presented on the snapshot, so that when a new entry is appended,
+	// it commits on the next idx.
+	//expectedIdx := snap.Index - conf.TrailingLogs
+	expectedIdx := uint64(0)
+
+	if idx, _ := leader.logs.FirstIndex(); idx != expectedIdx {
+
+		f, _ := leader.logs.FirstIndex()
+		l, _ := leader.logs.LastIndex()
+
+		t.Log("LogFirst:", f)
+		t.Log("LogLast:", l)
+
+		t.Log("E:", expectedIdx)
+		t.Log("I:", idx)
+		c.FailNowf("should trim logs to %d: but is %d", expectedIdx, idx)
+	}
+
+	// Shutdown
+	shutdown := leader.Shutdown()
+	if err := shutdown.Error(); err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	// Restart Raft
 	r := leader
 	// Can't just reuse the old transport as it will be closed
 	_, trans2 := NewInmemTransport(r.trans.LocalAddr())

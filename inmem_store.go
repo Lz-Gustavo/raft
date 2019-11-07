@@ -2,6 +2,7 @@ package raft
 
 import (
 	"errors"
+	"fmt"
 	"sync"
 )
 
@@ -84,9 +85,21 @@ func (i *InmemStore) StoreLogs(logs []*Log) error {
 func (i *InmemStore) DeleteRange(min, max uint64) error {
 	i.l.Lock()
 	defer i.l.Unlock()
+
+	fmt.Println("cautht here")
+	fmt.Println("log first: ", i.lowIndex)
+	fmt.Println("log last: ", i.highIndex)
+	fmt.Println("deleting : ", min)
+	fmt.Println("to : ", max)
+
+	fmt.Println("Log before: ", i.logs)
+
 	for j := min; j <= max; j++ {
 		delete(i.logs, j)
 	}
+
+	fmt.Println("Log after: ", i.logs)
+
 	if min <= i.lowIndex {
 		i.lowIndex = max + 1
 	}
@@ -97,6 +110,20 @@ func (i *InmemStore) DeleteRange(min, max uint64) error {
 		i.lowIndex = 0
 		i.highIndex = 0
 	}
+
+	// if max == i.highIndex {
+	// 	i.lowIndex--
+	// 	i.highIndex = i.lowIndex
+	// } else if max > i.highIndex {
+	// 	i.highIndex = min - 1
+	// }
+	// if i.lowIndex > i.highIndex {
+	// 	i.lowIndex = 0
+	// 	i.highIndex = 0
+	// }
+
+	fmt.Println("new log first: ", i.lowIndex)
+	fmt.Println("new log last: ", i.highIndex)
 	return nil
 }
 
