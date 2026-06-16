@@ -624,6 +624,9 @@ func (r *raft) maybeSendAppend(to uint64, sendIfEmpty bool) bool {
 	prevIndex := pr.Next - 1
 	prevTerm, err := r.raftLog.term(prevIndex)
 	if err != nil {
+		// TODO (Gus): monitor this ocurrence, maybe trigger a fatal during experiment?
+		// shouldn't be triggered, must configure huge snapshot interval (first evaluation)
+
 		// The log probably got truncated at >= pr.Next, so we can't catch up the
 		// follower log anymore. Send a snapshot instead.
 		return r.maybeSendSnapshot(to, pr)
@@ -646,6 +649,11 @@ func (r *raft) maybeSendAppend(to uint64, sendIfEmpty bool) bool {
 	if err != nil { // send a snapshot if we failed to get the entries
 		return r.maybeSendSnapshot(to, pr)
 	}
+
+	// NOTE (Gus): here it sends the actual AppendEntriesRPC with the new and/or missing
+	// entries on the follower's log.
+	//
+	// TODO: must monitor these index intervals during normal execution and on lag event
 
 	// Send the actual MsgApp otherwise, and update the progress accordingly.
 	r.send(&pb.Message{
@@ -1272,6 +1280,15 @@ func (r *raft) Step(m *pb.Message) error {
 
 type stepFunc func(r *raft, m *pb.Message) error
 
+// NOTE (Gus): func that is assigned as a stepFunc when a node becomes a leader.
+// it is triggered within node.run() event loop on every:
+//
+//  1. client proposal, by reading from <-propc channel (falls into the MsgProp message cases)
+//  2. follower responses, by reading from <-recvc channel (MsgAppResp, MsgSnapStatus)
+//  3. periodic tick of heartbeat, by receiving from <-tickc channel (eventually triggers MsgHeartbeatResp on 2.)
+//
+// In some cases, the func sends new AppendEntriesRPCs to followers, which result in responses
+// that consequently trigger new iterations of this same procedure.
 func stepLeader(r *raft, m *pb.Message) error {
 	// These message types do not require any progress for m.From.
 	switch m.GetType() {
@@ -1386,6 +1403,9 @@ func stepLeader(r *raft, m *pb.Message) error {
 		// an MsgAppResp to acknowledge the appended entries in the last Ready.
 
 		pr.RecentActive = true
+
+		// NOTE (Gus): here it identifies the lagged replica, must measure delay
+		// starting here
 
 		if m.GetReject() {
 			// RejectHint is the suggested next base entry for appending (i.e.
@@ -1513,6 +1533,10 @@ func stepLeader(r *raft, m *pb.Message) error {
 				if pr.State == tracker.StateReplicate {
 					pr.BecomeProbe()
 				}
+
+				// NOTE (Gus): sends index - 1 until if the msg is not rejected
+				// i.e. falls into the else condition bellow
+				// Then it proceeds to send the bulk of entries for the replica catch-up
 				r.sendAppend(m.GetFrom())
 			}
 		} else {
@@ -1566,6 +1590,10 @@ func stepLeader(r *raft, m *pb.Message) error {
 				// we have more entries to send, send as many messages as we
 				// can (without sending empty messages for the commit index)
 				if r.id != m.GetFrom() {
+
+					// NOTE (Gus): here it sends a bulk of messages for the replica catch-up
+					// must end measurement of entries after this iteration
+
 					for r.maybeSendAppend(m.GetFrom(), false /* sendIfEmpty */) {
 					}
 				}
