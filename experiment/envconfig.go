@@ -3,6 +3,7 @@ package experiment
 import (
 	"log"
 	"os"
+	"time"
 )
 
 const (
@@ -28,6 +29,13 @@ const (
 	// near located followers instead of relying on the leader. BeelogCatchUpEnabled flag
 	// must also be enabled.
 	NearFollowerCatchUpEnabled = "RAFT_NEAR_FOLLOWER_ENABLED"
+
+	// LocalFollowerLatencyEnabled enables an artificial latency increase on every follower
+	// response in the form of a Sleep() call for LocalFollowerLatencyDuration, in order to
+	// simulate a follower delay on local evaluations. Must not be enabled when evaluating
+	// on a distributed environment.
+	LocalFollowerLatencyEnabled  = "RAFT_LOCAL_FOLLOWER_LATENCY_ENABLED"
+	LocalFollowerLatencyDuration = "RAFT_LOCAL_FOLLOWER_LATENCY_DURATION"
 )
 
 const (
@@ -38,19 +46,22 @@ const (
 var Config = ExpConfig{}
 
 type ExpConfig struct {
-	MeasureFollowerLagEnabled bool
-	LagMsr                    *LagMsr
+	IsMeasureFollowerLagEnabled bool
+	LagMsr                      *LagMsr
 
-	MeasureFollowerCatchUpEnabled bool
-	CatchUpMsr                    *CatchUpMsr
+	IsMeasureFollowerCatchUpEnabled bool
+	CatchUpMsr                      *CatchUpMsr
 
-	BeelogCatchUpEnabled       bool
-	NearFollowerCatchUpEnabled bool
+	IsBeelogCatchUpEnabled       bool
+	IsNearFollowerCatchUpEnabled bool
+
+	IsLocalFollowerLatencyEnabled bool
+	LocalFollowerLatencyDuration  time.Duration
 }
 
 func LoadEnvConfig() {
-	_, Config.MeasureFollowerLagEnabled = os.LookupEnv(MeasureFollowerLagEnabled)
-	if Config.MeasureFollowerLagEnabled {
+	_, Config.IsMeasureFollowerLagEnabled = os.LookupEnv(MeasureFollowerLagEnabled)
+	if Config.IsMeasureFollowerLagEnabled {
 		fn, exists := os.LookupEnv(MeasureFollowerLagFilename)
 		if !exists {
 			fn = defaultFollowerLagFilename
@@ -63,8 +74,8 @@ func LoadEnvConfig() {
 		Config.LagMsr = lm
 	}
 
-	_, Config.MeasureFollowerCatchUpEnabled = os.LookupEnv(MeasureFollowerCatchUpEnabled)
-	if Config.MeasureFollowerCatchUpEnabled {
+	_, Config.IsMeasureFollowerCatchUpEnabled = os.LookupEnv(MeasureFollowerCatchUpEnabled)
+	if Config.IsMeasureFollowerCatchUpEnabled {
 		fn, exists := os.LookupEnv(MeasureFollowerCatchUpFilename)
 		if !exists {
 			fn = defaultFollowerCatchUpFilename
@@ -77,6 +88,16 @@ func LoadEnvConfig() {
 		Config.CatchUpMsr = cm
 	}
 
-	_, Config.BeelogCatchUpEnabled = os.LookupEnv(BeelogCatchUpEnabled)
-	_, Config.NearFollowerCatchUpEnabled = os.LookupEnv(NearFollowerCatchUpEnabled)
+	_, Config.IsBeelogCatchUpEnabled = os.LookupEnv(BeelogCatchUpEnabled)
+	_, Config.IsNearFollowerCatchUpEnabled = os.LookupEnv(NearFollowerCatchUpEnabled)
+
+	// NOTE (Gus): maybe refac to getenv -> parse pool instead to avoid missuse?
+	_, Config.IsLocalFollowerLatencyEnabled = os.LookupEnv(LocalFollowerLatencyEnabled)
+	if Config.IsLocalFollowerLatencyEnabled {
+		dur, err := time.ParseDuration(os.Getenv(LocalFollowerLatencyDuration))
+		if err != nil {
+			log.Fatalln(err)
+		}
+		Config.LocalFollowerLatencyDuration = dur
+	}
 }

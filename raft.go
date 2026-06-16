@@ -24,6 +24,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"time"
 
 	"google.golang.org/protobuf/proto"
 
@@ -1751,7 +1752,19 @@ func stepCandidate(r *raft, m *pb.Message) error {
 	return nil
 }
 
+// NOTE (Gus): follower step function that similarly to the leader, is called within the
+// node.run() event loop.
+//
+// The latency increase implemented here in the form of a sleep() func is intended to be used
+// only on initial local experiments to simulate a network latency on followers response, large
+// enough to result in a log replication lag, observed by AppendEntriesRPC rejection on the
+// stepLeader func (i.e. in m.GetReject() case). This behavior must be disable later when evaluating
+// on a distributed environment.
 func stepFollower(r *raft, m *pb.Message) error {
+	if experiment.Config.IsLocalFollowerLatencyEnabled {
+		time.Sleep(experiment.Config.LocalFollowerLatencyDuration)
+	}
+
 	switch m.GetType() {
 	case pb.MsgProp:
 		if r.lead == None {
