@@ -28,10 +28,16 @@ import (
 	"google.golang.org/protobuf/proto"
 
 	"go.etcd.io/raft/v3/confchange"
+	"go.etcd.io/raft/v3/experiment"
 	"go.etcd.io/raft/v3/quorum"
 	pb "go.etcd.io/raft/v3/raftpb"
 	"go.etcd.io/raft/v3/tracker"
 )
+
+// NOTE (Gus): initialize global measurement config struct from env, if enabled
+func init() {
+	experiment.LoadEnvConfig()
+}
 
 const (
 	// None is a placeholder node ID used when there is no leader.
@@ -1406,8 +1412,9 @@ func stepLeader(r *raft, m *pb.Message) error {
 
 		// NOTE (Gus): here it identifies the lagged replica, must measure delay
 		// starting here
-
 		if m.GetReject() {
+			experiment.Config.CatchUpMsr.Start()
+
 			// RejectHint is the suggested next base entry for appending (i.e.
 			// we try to append entry RejectHint+1 next), and LogTerm is the
 			// term that the follower has at index RejectHint. Older versions
@@ -1592,10 +1599,11 @@ func stepLeader(r *raft, m *pb.Message) error {
 				if r.id != m.GetFrom() {
 
 					// NOTE (Gus): here it sends a bulk of messages for the replica catch-up
-					// must end measurement of entries after this iteration
-
+					// must end measurement of catch-up duration after this iteration
 					for r.maybeSendAppend(m.GetFrom(), false /* sendIfEmpty */) {
 					}
+
+					experiment.Config.CatchUpMsr.End()
 				}
 				// Transfer leadership is in progress.
 				if m.GetFrom() == r.leadTransferee && pr.Match == r.raftLog.lastIndex() {
