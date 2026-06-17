@@ -3,6 +3,7 @@ package experiment
 import (
 	"log"
 	"os"
+	"strconv"
 	"time"
 )
 
@@ -60,44 +61,55 @@ type ExpConfig struct {
 }
 
 func LoadEnvConfig() {
-	_, Config.IsMeasureFollowerLagEnabled = os.LookupEnv(MeasureFollowerLagEnabled)
+	var err error
+
+	Config.IsMeasureFollowerLagEnabled = parseEnvBool(MeasureFollowerLagEnabled)
 	if Config.IsMeasureFollowerLagEnabled {
 		fn, exists := os.LookupEnv(MeasureFollowerLagFilename)
 		if !exists {
 			fn = defaultFollowerLagFilename
 		}
 
-		lm, err := NewLagMsr(fn, os.Getenv(MeasureFollowerLagInterval))
+		Config.LagMsr, err = NewLagMsr(fn, os.Getenv(MeasureFollowerLagInterval))
 		if err != nil {
 			log.Fatalln(err)
 		}
-		Config.LagMsr = lm
 	}
 
-	_, Config.IsMeasureFollowerCatchUpEnabled = os.LookupEnv(MeasureFollowerCatchUpEnabled)
+	Config.IsMeasureFollowerCatchUpEnabled = parseEnvBool(MeasureFollowerCatchUpEnabled)
 	if Config.IsMeasureFollowerCatchUpEnabled {
 		fn, exists := os.LookupEnv(MeasureFollowerCatchUpFilename)
 		if !exists {
 			fn = defaultFollowerCatchUpFilename
 		}
 
-		cm, err := NewCatchUpMsr(fn)
+		Config.CatchUpMsr, err = NewCatchUpMsr(fn)
 		if err != nil {
 			log.Fatalln(err)
 		}
-		Config.CatchUpMsr = cm
 	}
 
-	_, Config.IsBeelogCatchUpEnabled = os.LookupEnv(BeelogCatchUpEnabled)
-	_, Config.IsNearFollowerCatchUpEnabled = os.LookupEnv(NearFollowerCatchUpEnabled)
+	Config.IsBeelogCatchUpEnabled = parseEnvBool(BeelogCatchUpEnabled)
+	Config.IsNearFollowerCatchUpEnabled = parseEnvBool(NearFollowerCatchUpEnabled)
 
-	// NOTE (Gus): maybe refac to getenv -> parse pool instead to avoid missuse?
-	_, Config.IsLocalFollowerLatencyEnabled = os.LookupEnv(LocalFollowerLatencyEnabled)
+	Config.IsLocalFollowerLatencyEnabled = parseEnvBool(LocalFollowerLatencyEnabled)
 	if Config.IsLocalFollowerLatencyEnabled {
-		dur, err := time.ParseDuration(os.Getenv(LocalFollowerLatencyDuration))
+		Config.LocalFollowerLatencyDuration, err = time.ParseDuration(os.Getenv(LocalFollowerLatencyDuration))
 		if err != nil {
 			log.Fatalln(err)
 		}
-		Config.LocalFollowerLatencyDuration = dur
 	}
+}
+
+func parseEnvBool(env string) bool {
+	raw, exists := os.LookupEnv(env)
+	if !exists {
+		return false
+	}
+
+	val, err := strconv.ParseBool(raw)
+	if err != nil {
+		return false
+	}
+	return val
 }

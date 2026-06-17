@@ -1414,7 +1414,10 @@ func stepLeader(r *raft, m *pb.Message) error {
 		// NOTE (Gus): here it identifies the lagged replica, must measure delay
 		// starting here
 		if m.GetReject() {
-			experiment.Config.CatchUpMsr.Start()
+			if experiment.Config.IsMeasureFollowerCatchUpEnabled {
+				//log.Fatalf("DETECTED LAG!!!, message: %v\n", m.String())
+				experiment.Config.CatchUpMsr.Start()
+			}
 
 			// RejectHint is the suggested next base entry for appending (i.e.
 			// we try to append entry RejectHint+1 next), and LogTerm is the
@@ -1604,7 +1607,9 @@ func stepLeader(r *raft, m *pb.Message) error {
 					for r.maybeSendAppend(m.GetFrom(), false /* sendIfEmpty */) {
 					}
 
-					experiment.Config.CatchUpMsr.End()
+					if experiment.Config.IsMeasureFollowerCatchUpEnabled {
+						experiment.Config.CatchUpMsr.End()
+					}
 				}
 				// Transfer leadership is in progress.
 				if m.GetFrom() == r.leadTransferee && pr.Match == r.raftLog.lastIndex() {
