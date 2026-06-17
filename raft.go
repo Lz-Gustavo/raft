@@ -1414,7 +1414,10 @@ func stepLeader(r *raft, m *pb.Message) error {
 		// NOTE (Gus): here it identifies the lagged replica, must measure delay
 		// starting here
 		if m.GetReject() {
-			if experiment.Config.IsMeasureFollowerCatchUpEnabled {
+			// (Gus): the AND condition is set to start measurement once per follower
+			// catch-up (i.e. before it detects the lag and transitions to StateProbe)
+			// in order to avoid measurement overwrite
+			if experiment.Config.IsMeasureFollowerCatchUpEnabled && pr.State != tracker.StateProbe {
 				//log.Fatalf("DETECTED LAG!!!, message: %v\n", m.String())
 				experiment.Config.CatchUpMsr.Start()
 			}
@@ -1563,6 +1566,11 @@ func stepLeader(r *raft, m *pb.Message) error {
 				switch {
 				case pr.State == tracker.StateProbe:
 					pr.BecomeReplicate()
+					// NOTE (Gus): catch-up procedure completed, follower is now fully replicated
+					if experiment.Config.IsMeasureFollowerCatchUpEnabled {
+						experiment.Config.CatchUpMsr.End()
+					}
+
 				case pr.State == tracker.StateSnapshot && pr.Match+1 >= r.raftLog.firstIndex():
 					// Note that we don't take into account PendingSnapshot to
 					// enter this branch. No matter at which index a snapshot
@@ -1602,14 +1610,18 @@ func stepLeader(r *raft, m *pb.Message) error {
 				// can (without sending empty messages for the commit index)
 				if r.id != m.GetFrom() {
 
-					// NOTE (Gus): here it sends a bulk of messages for the replica catch-up
-					// must end measurement of catch-up duration after this iteration
 					for r.maybeSendAppend(m.GetFrom(), false /* sendIfEmpty */) {
 					}
 
-					if experiment.Config.IsMeasureFollowerCatchUpEnabled {
-						experiment.Config.CatchUpMsr.End()
-					}
+					// NOTE (Gus): the for iteration above seems to send a bulk of messages
+					// for the replica catch-up.
+					//
+					// Measurement was first implemented below, but later moved to th
+					// StateProbe→StateReplicate transition above. Keep as comment for now
+					//
+					//if experiment.Config.IsMeasureFollowerCatchUpEnabled {
+					//	experiment.Config.CatchUpMsr.End()
+					//}
 				}
 				// Transfer leadership is in progress.
 				if m.GetFrom() == r.leadTransferee && pr.Match == r.raftLog.lastIndex() {
