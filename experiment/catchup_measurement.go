@@ -29,7 +29,14 @@ func NewCatchUpMsr(fn string) (*CatchUpMsr, error) {
 	return cm, nil
 }
 
+// Start ...
+//
+// NOTE: avoids measure if a Start() call was already issued so that responses that are rejected
+// by lag, before the catch-up procedure is finished, do not overwrite the initial measurement
 func (cm *CatchUpMsr) Start() {
+	if cm.startMsr != 0 {
+		return
+	}
 	cm.startMsr = time.Now().UnixNano()
 }
 

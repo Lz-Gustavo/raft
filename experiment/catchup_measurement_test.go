@@ -1,6 +1,7 @@
 package experiment_test
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
 	"testing"
@@ -14,7 +15,7 @@ func TestCatchUpMsr_StartAndEnd(t *testing.T) {
 	tests := []struct {
 		name        string
 		measurement func(*testing.T, *experiment.CatchUpMsr)
-		expectEntry bool
+		expectedN   int
 	}{
 		{
 			name: "start and end records duration",
@@ -23,7 +24,7 @@ func TestCatchUpMsr_StartAndEnd(t *testing.T) {
 				time.Sleep(10 * time.Millisecond)
 				cm.End()
 			},
-			expectEntry: true,
+			expectedN: 1,
 		},
 		{
 			name: "multiple measurements",
@@ -34,14 +35,14 @@ func TestCatchUpMsr_StartAndEnd(t *testing.T) {
 					cm.End()
 				}
 			},
-			expectEntry: true,
+			expectedN: 3,
 		},
 		{
 			name: "end without start does nothing",
 			measurement: func(t *testing.T, cm *experiment.CatchUpMsr) {
 				cm.End() // Should not record anything
 			},
-			expectEntry: false,
+			expectedN: 0,
 		},
 		{
 			name: "start without end",
@@ -49,7 +50,19 @@ func TestCatchUpMsr_StartAndEnd(t *testing.T) {
 				cm.Start()
 				// Don't call End - should not panic
 			},
-			expectEntry: false,
+			expectedN: 0,
+		},
+		{
+			name: "multiple starts before end avoids overwriting measurement",
+			measurement: func(t *testing.T, cm *experiment.CatchUpMsr) {
+				cm.Start()
+				time.Sleep(10 * time.Millisecond)
+				// Second Start() call should be ignored due to protection
+				cm.Start()
+				time.Sleep(5 * time.Millisecond)
+				cm.End()
+			},
+			expectedN: 1,
 		},
 	}
 
@@ -68,8 +81,8 @@ func TestCatchUpMsr_StartAndEnd(t *testing.T) {
 			data, err := os.ReadFile(fn)
 			assert.NoError(t, err, "failed to read measurement file")
 
-			hasContent := len(data) > 0
-			assert.Equal(t, hasContent, tt.expectEntry)
+			lines := bytes.Split(data, []byte("\n"))
+			assert.Equal(t, tt.expectedN, len(lines)-1)
 		})
 	}
 }

@@ -1409,10 +1409,7 @@ func stepLeader(r *raft, m *pb.Message) error {
 		// NOTE (Gus): here it identifies the lagged replica, must measure delay
 		// starting here
 		if m.GetReject() {
-			// (Gus): the AND condition is set to start measurement once per follower
-			// catch-up (i.e. before it detects the lag and transitions to StateProbe)
-			// in order to avoid measurement overwrite
-			if experiment.Config.IsMeasureFollowerCatchUpEnabled && pr.State != tracker.StateProbe {
+			if experiment.Config.IsMeasureFollowerCatchUpEnabled {
 				//log.Fatalf("DETECTED LAG!!!, message: %v\n", m.String())
 				experiment.Config.CatchUpMsr.Start()
 			}
