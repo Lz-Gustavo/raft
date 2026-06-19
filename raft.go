@@ -35,11 +35,6 @@ import (
 	"go.etcd.io/raft/v3/tracker"
 )
 
-// NOTE (Gus): initialize global measurement config struct from env, if enabled
-func init() {
-	experiment.LoadEnvConfig()
-}
-
 const (
 	// None is a placeholder node ID used when there is no leader.
 	None uint64 = 0

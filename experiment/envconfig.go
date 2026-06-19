@@ -37,11 +37,16 @@ const (
 	// on a distributed environment.
 	LocalFollowerLatencyEnabled  = "RAFT_LOCAL_FOLLOWER_LATENCY_ENABLED"
 	LocalFollowerLatencyDuration = "RAFT_LOCAL_FOLLOWER_LATENCY_DURATION"
+
+	// MeasureEtcdThroughputEnabled ...
+	MeasureEtcdThroughputEnabled  = "ETCD_MEASURE_THR_ENABLED"
+	MeasureEtcdThroughputFilename = "ETCD_MEASURE_THR_FILENAME"
 )
 
 const (
 	defaultFollowerLagFilename     = "/tmp/follower-lag.out"
 	defaultFollowerCatchUpFilename = "/tmp/follower-catchup-time.out"
+	defaultEtcdThroughputFilename  = "/tmp/etcd-throughput.out"
 )
 
 var Config = ExpConfig{}
@@ -58,6 +63,9 @@ type ExpConfig struct {
 
 	IsLocalFollowerLatencyEnabled bool
 	LocalFollowerLatencyDuration  time.Duration
+
+	IsMeasureEtcdThoughputEnabled bool
+	ThrMsr                        *ThrMsr
 }
 
 func LoadEnvConfig() {
@@ -95,6 +103,19 @@ func LoadEnvConfig() {
 	Config.IsLocalFollowerLatencyEnabled = parseEnvBool(LocalFollowerLatencyEnabled)
 	if Config.IsLocalFollowerLatencyEnabled {
 		Config.LocalFollowerLatencyDuration, err = time.ParseDuration(os.Getenv(LocalFollowerLatencyDuration))
+		if err != nil {
+			log.Fatalln(err)
+		}
+	}
+
+	Config.IsMeasureEtcdThoughputEnabled = parseEnvBool(MeasureEtcdThroughputEnabled)
+	if Config.IsMeasureEtcdThoughputEnabled {
+		fn, exists := os.LookupEnv(MeasureEtcdThroughputFilename)
+		if !exists {
+			fn = defaultEtcdThroughputFilename
+		}
+
+		Config.ThrMsr, err = NewThrMsr(fn)
 		if err != nil {
 			log.Fatalln(err)
 		}
