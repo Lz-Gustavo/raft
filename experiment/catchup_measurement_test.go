@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/assert"
 	"go.etcd.io/raft/v3/experiment"
 )
 
@@ -58,23 +59,17 @@ func TestCatchUpMsr_StartAndEnd(t *testing.T) {
 			fn := filepath.Join(tmpDir, "test-measurement.out")
 
 			cm, err := experiment.NewCatchUpMsr(fn)
-			if err != nil {
-				t.Fatalf("NewCatchUpMsr() failed: %v", err)
-			}
+			assert.NoError(t, err, "NewCatchUpMsr() failed")
 			defer cm.Close()
 
 			tt.measurement(t, cm)
 
 			cm.Flush()
 			data, err := os.ReadFile(fn)
-			if err != nil {
-				t.Fatalf("failed to read measurement file: %v", err)
-			}
+			assert.NoError(t, err, "failed to read measurement file")
 
 			hasContent := len(data) > 0
-			if hasContent != tt.expectEntry {
-				t.Errorf("file has content = %v, expectEntry = %v", hasContent, tt.expectEntry)
-			}
+			assert.Equal(t, hasContent, tt.expectEntry)
 		})
 	}
 }
