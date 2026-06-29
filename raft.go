@@ -1558,10 +1558,6 @@ func stepLeader(r *raft, m *pb.Message) error {
 				switch {
 				case pr.State == tracker.StateProbe:
 					pr.BecomeReplicate()
-					// NOTE (Gus): catch-up procedure completed, follower is now fully replicated
-					if experiment.Config.IsMeasureFollowerCatchUpEnabled {
-						experiment.Config.CatchUpMsr.End()
-					}
 
 				case pr.State == tracker.StateSnapshot && pr.Match+1 >= r.raftLog.firstIndex():
 					// Note that we don't take into account PendingSnapshot to
@@ -1604,17 +1600,12 @@ func stepLeader(r *raft, m *pb.Message) error {
 
 					for r.maybeSendAppend(m.GetFrom(), false /* sendIfEmpty */) {
 					}
-
-					// NOTE (Gus): the for iteration above seems to send a bulk of messages
-					// for the replica catch-up.
-					//
-					// Measurement was first implemented below, but later moved to th
-					// StateProbe→StateReplicate transition above. Keep as comment for now
-					//
-					//if experiment.Config.IsMeasureFollowerCatchUpEnabled {
-					//	experiment.Config.CatchUpMsr.End()
-					//}
 				}
+
+				// NOTE (Gus): maybe signal end of measure, in case follower was already
+				// recovered to latest state
+				r.maybeEndCatchUpMeasurement(pr)
+
 				// Transfer leadership is in progress.
 				if m.GetFrom() == r.leadTransferee && pr.Match == r.raftLog.lastIndex() {
 					r.logger.Infof("%x sent MsgTimeoutNow to %x after received MsgAppResp", r.id, m.GetFrom())
@@ -2217,4 +2208,21 @@ func sendMsgReadIndexResponse(r *raft, m *pb.Message) {
 			r.send(resp)
 		}
 	}
+}
+
+// NOTE (Gus): describe...
+func (r *raft) maybeEndCatchUpMeasurement(pr *tracker.Progress) {
+	if !experiment.Config.IsMeasureFollowerCatchUpEnabled || experiment.Config.CatchUpMsr == nil {
+		return
+	}
+	if pr.State != tracker.StateReplicate {
+		return
+	}
+	if pr.Match != r.raftLog.lastIndex() {
+		return
+	}
+	if pr.Inflights.Count() != 0 {
+		return
+	}
+	experiment.Config.CatchUpMsr.End()
 }
