@@ -8,6 +8,8 @@ import (
 	"time"
 )
 
+const measurementFmt = "%d:%d\n"
+
 type CatchUpMsr struct {
 	startMsr int64
 
@@ -48,7 +50,7 @@ func (cm *CatchUpMsr) End() {
 	now := time.Now().UnixNano()
 	dur := now - cm.startMsr
 
-	if _, err := fmt.Fprintln(cm.buff, dur); err != nil {
+	if _, err := fmt.Fprintf(cm.buff, "%d:%d\n", cm.startMsr, dur); err != nil {
 		log.Fatalln("failed recording duration, err:", err)
 	}
 	cm.startMsr = 0
