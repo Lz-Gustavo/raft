@@ -22,6 +22,10 @@ const (
 	MeasureFollowerCatchUpEnabled  = "RAFT_MEASURE_FOLLOWER_CATCHUP_ENABLED"
 	MeasureFollowerCatchUpFilename = "RAFT_MEASURE_FOLLOWER_CATCHUP_FILENAME"
 
+	// MeasureFollowerCatchUpDebugEnabled enables extra fields in catch-up
+	// measurements to help inspect log replication during recovery.
+	MeasureFollowerCatchUpDebugEnabled = "RAFT_MEASURE_FOLLOWER_CATCHUP_DEBUG_ENABLED"
+
 	// BeelogCatchUpEnabled enables the usage of a compacted in-memory state to serve delayed
 	// replicas during catch-up phase.
 	BeelogCatchUpEnabled = "RAFT_BEELOG_CATCHUP_ENABLED"
@@ -55,8 +59,9 @@ type ExpConfig struct {
 	IsMeasureFollowerLagEnabled bool
 	LagMsr                      *LagMsr
 
-	IsMeasureFollowerCatchUpEnabled bool
-	CatchUpMsr                      *CatchUpMsr
+	IsMeasureFollowerCatchUpEnabled      bool
+	CatchUpMsr                           *CatchUpMsr
+	IsMeasureFollowerCatchUpDebugEnabled bool
 
 	IsBeelogCatchUpEnabled       bool
 	IsNearFollowerCatchUpEnabled bool
@@ -96,6 +101,7 @@ func LoadEnvConfig() {
 			log.Fatalln(err)
 		}
 	}
+	Config.IsMeasureFollowerCatchUpDebugEnabled = parseEnvBool(MeasureFollowerCatchUpDebugEnabled)
 
 	Config.IsBeelogCatchUpEnabled = parseEnvBool(BeelogCatchUpEnabled)
 	Config.IsNearFollowerCatchUpEnabled = parseEnvBool(NearFollowerCatchUpEnabled)

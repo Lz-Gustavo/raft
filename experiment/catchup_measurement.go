@@ -6,9 +6,26 @@ import (
 	"log"
 	"os"
 	"time"
+
+	"go.etcd.io/raft/v3/tracker"
 )
 
-const measurementFmt = "%d:%d\n"
+const (
+	catchupMeasurementFmt      = "%d:%d\n"
+	catchupMeasurementDebugFmt = "%d:%d %s\n"
+)
+
+type CatchUpDebugInfo struct {
+	LogEntries        uint64
+	LeaderFirstIndex  uint64
+	LeaderLastIndex   uint64
+	LeaderCommitted   uint64
+	LeaderApplied     uint64
+	FollowerMatch     uint64
+	FollowerNext      uint64
+	FollowerInflights int
+	FollowerState     tracker.StateType
+}
 
 type CatchUpMsr struct {
 	startMsr int64
@@ -43,6 +60,14 @@ func (cm *CatchUpMsr) Start() {
 }
 
 func (cm *CatchUpMsr) End() {
+	cm.end(nil)
+}
+
+func (cm *CatchUpMsr) EndDebug(info CatchUpDebugInfo) {
+	cm.end(&info)
+}
+
+func (cm *CatchUpMsr) end(info *CatchUpDebugInfo) {
 	if cm.startMsr == 0 {
 		return
 	}
@@ -50,10 +75,31 @@ func (cm *CatchUpMsr) End() {
 	now := time.Now().UnixNano()
 	dur := now - cm.startMsr
 
-	if _, err := fmt.Fprintf(cm.buff, "%d:%d\n", cm.startMsr, dur); err != nil {
-		log.Fatalln("failed recording duration, err:", err)
+	if info == nil {
+		if _, err := fmt.Fprintf(cm.buff, catchupMeasurementFmt, cm.startMsr, dur); err != nil {
+			log.Fatalln("failed recording duration, err:", err)
+		}
+
+	} else {
+		if _, err := fmt.Fprintf(cm.buff, catchupMeasurementDebugFmt, cm.startMsr, dur, formatCatchUpDebugInfo(*info)); err != nil {
+			log.Fatalln("failed recording duration debug, err:", err)
+		}
 	}
 	cm.startMsr = 0
+}
+
+func formatCatchUpDebugInfo(info CatchUpDebugInfo) string {
+	return fmt.Sprintf("[logEntries:%d, leader:{firstIndex:%d, lastIndex:%d, committed:%d, applied:%d}, follower:{match:%d, next:%d, inflights:%d, state:%s}]",
+		info.LogEntries,
+		info.LeaderFirstIndex,
+		info.LeaderLastIndex,
+		info.LeaderCommitted,
+		info.LeaderApplied,
+		info.FollowerMatch,
+		info.FollowerNext,
+		info.FollowerInflights,
+		info.FollowerState,
+	)
 }
 
 func (cm *CatchUpMsr) Flush() {

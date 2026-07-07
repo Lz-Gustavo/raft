@@ -2218,10 +2218,32 @@ func (r *raft) maybeEndCatchUpMeasurement(pr *tracker.Progress) {
 	if pr.State != tracker.StateReplicate {
 		return
 	}
-	if pr.Match != r.raftLog.lastIndex() {
+	lastIndex := r.raftLog.lastIndex()
+	if pr.Match != lastIndex {
 		return
 	}
 	if pr.Inflights.Count() != 0 {
+		return
+	}
+
+	if experiment.Config.IsMeasureFollowerCatchUpDebugEnabled {
+		firstIndex := r.raftLog.firstIndex()
+		var logEntries uint64
+		if lastIndex >= firstIndex {
+			logEntries = lastIndex - firstIndex + 1
+		}
+
+		experiment.Config.CatchUpMsr.EndDebug(experiment.CatchUpDebugInfo{
+			LogEntries:        logEntries,
+			LeaderFirstIndex:  firstIndex,
+			LeaderLastIndex:   lastIndex,
+			LeaderCommitted:   r.raftLog.committed,
+			LeaderApplied:     r.raftLog.applied,
+			FollowerMatch:     pr.Match,
+			FollowerNext:      pr.Next,
+			FollowerInflights: pr.Inflights.Count(),
+			FollowerState:     pr.State,
+		})
 		return
 	}
 	experiment.Config.CatchUpMsr.End()
