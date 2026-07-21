@@ -45,6 +45,13 @@ const (
 	// MeasureEtcdThroughputEnabled ...
 	MeasureEtcdThroughputEnabled  = "ETCD_MEASURE_THR_ENABLED"
 	MeasureEtcdThroughputFilename = "ETCD_MEASURE_THR_FILENAME"
+
+	// EtcdDisableTooManyRequests allows the disable of "too many requests" errors that are returned
+	// by etcd when the difference between the apply (executed) to commit (decided by Raft) indexes
+	// exceeds a 5k limit. The error is intended to avoid over-saturating the database when is already
+	// delayed. This config var is implemented to allow an evaluation on how the commit/apply index gap
+	// evolves on a scenario with hetegoneous latency values between participants.
+	EtcdDisableTooManyRequests = "ETCD_DISABLE_TOO_MANY_REQUESTS"
 )
 
 const (
@@ -71,6 +78,8 @@ type ExpConfig struct {
 
 	IsMeasureEtcdThoughputEnabled bool
 	ThrMsr                        *ThrMsr
+
+	IsEtcdTooManyRequestsDisabled bool
 }
 
 func LoadEnvConfig() {
@@ -126,6 +135,7 @@ func LoadEnvConfig() {
 			log.Fatalln(err)
 		}
 	}
+	Config.IsEtcdTooManyRequestsDisabled = parseEnvBool(EtcdDisableTooManyRequests)
 }
 
 func parseEnvBool(env string) bool {
