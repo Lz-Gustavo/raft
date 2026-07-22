@@ -1604,7 +1604,7 @@ func stepLeader(r *raft, m *pb.Message) error {
 
 				// NOTE (Gus): maybe signal end of measure, in case follower was already
 				// recovered to latest state
-				r.maybeEndCatchUpMeasurement(pr)
+				r.maybeEndCatchUpMeasurement(m.GetTo(), pr)
 
 				// Transfer leadership is in progress.
 				if m.GetFrom() == r.leadTransferee && pr.Match == r.raftLog.lastIndex() {
@@ -2211,7 +2211,7 @@ func sendMsgReadIndexResponse(r *raft, m *pb.Message) {
 }
 
 // NOTE (Gus): describe...
-func (r *raft) maybeEndCatchUpMeasurement(pr *tracker.Progress) {
+func (r *raft) maybeEndCatchUpMeasurement(to uint64, pr *tracker.Progress) {
 	if !experiment.Config.IsMeasureFollowerCatchUpEnabled || experiment.Config.CatchUpMsr == nil {
 		return
 	}
@@ -2243,6 +2243,7 @@ func (r *raft) maybeEndCatchUpMeasurement(pr *tracker.Progress) {
 			FollowerNext:      pr.Next,
 			FollowerInflights: pr.Inflights.Count(),
 			FollowerState:     pr.State,
+			FollowerID:        to,
 		})
 		return
 	}

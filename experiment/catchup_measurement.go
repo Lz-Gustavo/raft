@@ -25,6 +25,7 @@ type CatchUpDebugInfo struct {
 	FollowerNext      uint64
 	FollowerInflights int
 	FollowerState     tracker.StateType
+	FollowerID        uint64
 }
 
 type CatchUpMsr struct {
@@ -89,12 +90,13 @@ func (cm *CatchUpMsr) end(info *CatchUpDebugInfo) {
 }
 
 func formatCatchUpDebugInfo(info CatchUpDebugInfo) string {
-	return fmt.Sprintf("[logEntries:%d, leader:{firstIndex:%d, lastIndex:%d, committed:%d, applied:%d}, follower:{match:%d, next:%d, inflights:%d, state:%s}]",
+	return fmt.Sprintf("[logEntries:%d, leader:{firstIndex:%d, lastIndex:%d, committed:%d, applied:%d}, follower:{id:%d, match:%d, next:%d, inflights:%d, state:%s}]",
 		info.LogEntries,
 		info.LeaderFirstIndex,
 		info.LeaderLastIndex,
 		info.LeaderCommitted,
 		info.LeaderApplied,
+		info.FollowerID,
 		info.FollowerMatch,
 		info.FollowerNext,
 		info.FollowerInflights,
