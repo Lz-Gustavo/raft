@@ -52,12 +52,18 @@ const (
 	// delayed. This config var is implemented to allow an evaluation on how the commit/apply index gap
 	// evolves on a scenario with hetegoneous latency values between participants.
 	EtcdDisableTooManyRequests = "ETCD_DISABLE_TOO_MANY_REQUESTS"
+
+	// EtcdClusterStatusEnabled enables a routine, launched on etcdserver, that periodically outputs
+	// cluster information and members status on EtcdClusterStatusFilename.
+	EtcdClusterStatusEnabled  = "ETCD_CLUSTER_STATUS_ENABLED"
+	EtcdClusterStatusFilename = "ETCD_CLUSTER_STATUS_FILENAME"
 )
 
 const (
-	defaultFollowerLagFilename     = "/tmp/follower-lag.out"
-	defaultFollowerCatchUpFilename = "/tmp/follower-catchup-time.out"
-	defaultEtcdThroughputFilename  = "/tmp/etcd-throughput.out"
+	defaultFollowerLagFilename       = "/tmp/follower-lag.out"
+	defaultFollowerCatchUpFilename   = "/tmp/follower-catchup-time.out"
+	defaultEtcdThroughputFilename    = "/tmp/etcd-throughput.out"
+	defaultEtcdClusterStatusFilename = "/tmp/etcd-cluster-status.out"
 )
 
 var Config = ExpConfig{}
@@ -80,6 +86,9 @@ type ExpConfig struct {
 	ThrMsr                        *ThrMsr
 
 	IsEtcdTooManyRequestsDisabled bool
+
+	IsEtcdClusterStatusEnabled bool
+	EtcdClusterStatusFilename  string
 }
 
 func LoadEnvConfig() {
@@ -136,6 +145,15 @@ func LoadEnvConfig() {
 		}
 	}
 	Config.IsEtcdTooManyRequestsDisabled = parseEnvBool(EtcdDisableTooManyRequests)
+
+	Config.IsEtcdClusterStatusEnabled = parseEnvBool(EtcdClusterStatusEnabled)
+	if Config.IsEtcdClusterStatusEnabled {
+		fn, exists := os.LookupEnv(EtcdClusterStatusFilename)
+		if !exists {
+			fn = defaultEtcdClusterStatusFilename
+		}
+		Config.EtcdClusterStatusFilename = fn
+	}
 }
 
 func parseEnvBool(env string) bool {

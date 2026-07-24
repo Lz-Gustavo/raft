@@ -9,7 +9,6 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"go.etcd.io/raft/v3/experiment"
-	"go.etcd.io/raft/v3/tracker"
 )
 
 func TestCatchUpMsr_StartAndEnd(t *testing.T) {
@@ -101,15 +100,14 @@ func TestCatchUpMsr_StartAndEndDebug(t *testing.T) {
 				cm.Start()
 				time.Sleep(10 * time.Millisecond)
 				cm.EndDebug(experiment.CatchUpDebugInfo{
-					LogEntries:        9,
-					LeaderFirstIndex:  10,
-					LeaderLastIndex:   18,
-					LeaderCommitted:   17,
-					LeaderApplied:     16,
-					FollowerMatch:     18,
-					FollowerNext:      19,
-					FollowerInflights: 0,
-					FollowerState:     tracker.StateReplicate,
+					LogEntries:       9,
+					LeaderFirstIndex: 10,
+					LeaderLastIndex:  18,
+					LeaderCommitted:  17,
+					LeaderApplied:    16,
+					FollowerMatch:    18,
+					FollowerNext:     19,
+					Message:          "foo",
 				})
 			},
 			expectedN: 1,
@@ -117,26 +115,25 @@ func TestCatchUpMsr_StartAndEndDebug(t *testing.T) {
 				"[",
 				"]",
 				"logEntries:9",
+				"message:{foo}",
 				"leader:{firstIndex:10, lastIndex:18, committed:17, applied:16}",
-				"follower:{match:18, next:19, inflights:0, state:StateReplicate}",
+				"follower:{match:18, next:19}",
 			},
 		},
 		{
 			name: "multiple debug measurements",
 			measurement: func(t *testing.T, cm *experiment.CatchUpMsr) {
-				for i := 0; i < 3; i++ {
+				for range 3 {
 					cm.Start()
 					time.Sleep(5 * time.Millisecond)
 					cm.EndDebug(experiment.CatchUpDebugInfo{
-						LogEntries:        1,
-						LeaderFirstIndex:  1,
-						LeaderLastIndex:   1,
-						LeaderCommitted:   1,
-						LeaderApplied:     1,
-						FollowerMatch:     1,
-						FollowerNext:      2,
-						FollowerInflights: 0,
-						FollowerState:     tracker.StateReplicate,
+						LogEntries:       1,
+						LeaderFirstIndex: 1,
+						LeaderLastIndex:  1,
+						LeaderCommitted:  1,
+						LeaderApplied:    1,
+						FollowerMatch:    1,
+						FollowerNext:     2,
 					})
 				}
 			},
@@ -166,15 +163,12 @@ func TestCatchUpMsr_StartAndEndDebug(t *testing.T) {
 				cm.Start()
 				time.Sleep(5 * time.Millisecond)
 				cm.EndDebug(experiment.CatchUpDebugInfo{
-					LogEntries:        1,
-					LeaderFirstIndex:  1,
-					LeaderLastIndex:   1,
-					LeaderCommitted:   1,
-					LeaderApplied:     1,
-					FollowerMatch:     1,
-					FollowerNext:      2,
-					FollowerInflights: 0,
-					FollowerState:     tracker.StateReplicate,
+					LeaderFirstIndex: 1,
+					LeaderLastIndex:  1,
+					LeaderCommitted:  1,
+					LeaderApplied:    1,
+					FollowerMatch:    1,
+					FollowerNext:     2,
 				})
 			},
 			expectedN: 1,

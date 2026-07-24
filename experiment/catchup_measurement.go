@@ -6,8 +6,6 @@ import (
 	"log"
 	"os"
 	"time"
-
-	"go.etcd.io/raft/v3/tracker"
 )
 
 const (
@@ -16,16 +14,14 @@ const (
 )
 
 type CatchUpDebugInfo struct {
-	LogEntries        uint64
-	LeaderFirstIndex  uint64
-	LeaderLastIndex   uint64
-	LeaderCommitted   uint64
-	LeaderApplied     uint64
-	FollowerMatch     uint64
-	FollowerNext      uint64
-	FollowerInflights int
-	FollowerState     tracker.StateType
-	FollowerID        uint64
+	LogEntries       uint64
+	LeaderFirstIndex uint64
+	LeaderLastIndex  uint64
+	LeaderCommitted  uint64
+	LeaderApplied    uint64
+	FollowerMatch    uint64
+	FollowerNext     uint64
+	Message          string
 }
 
 type CatchUpMsr struct {
@@ -90,17 +86,15 @@ func (cm *CatchUpMsr) end(info *CatchUpDebugInfo) {
 }
 
 func formatCatchUpDebugInfo(info CatchUpDebugInfo) string {
-	return fmt.Sprintf("[logEntries:%d, leader:{firstIndex:%d, lastIndex:%d, committed:%d, applied:%d}, follower:{id:%d, match:%d, next:%d, inflights:%d, state:%s}]",
+	return fmt.Sprintf("[logEntries:%d, logleader:{firstIndex:%d, lastIndex:%d, committed:%d, applied:%d}, follower:{match:%d, next:%d}, message:{%s}]",
 		info.LogEntries,
 		info.LeaderFirstIndex,
 		info.LeaderLastIndex,
 		info.LeaderCommitted,
 		info.LeaderApplied,
-		info.FollowerID,
 		info.FollowerMatch,
 		info.FollowerNext,
-		info.FollowerInflights,
-		info.FollowerState,
+		info.Message,
 	)
 }
 
