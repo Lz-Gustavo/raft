@@ -788,6 +788,13 @@ func (r *raft) maybeCommit() bool {
 	return r.raftLog.maybeCommit(entryID{term: r.Term, index: r.trk.Committed()})
 }
 
+// NOTE (Gus): reports whether the leader's log cannot fully commit up to its
+// own last index without an acknowledgement from follower id — i.e. whether
+// id is presently on the quorum-critical path for the catch-up measurement.
+func (r *raft) followerAckRequiredForQuorum(id uint64) bool {
+	return r.trk.CommittedWithout(id) < r.raftLog.lastIndex()
+}
+
 func (r *raft) reset(term uint64) {
 	if r.Term != term {
 		r.Term = term
@@ -1409,9 +1416,11 @@ func stepLeader(r *raft, m *pb.Message) error {
 		// NOTE (Gus): here it identifies the lagged replica, must measure delay
 		// starting here
 		if m.GetReject() {
-			if experiment.Config.IsMeasureFollowerCatchUpEnabled {
-				//log.Fatalf("DETECTED LAG!!!, message: %v\n", m.String())
-				experiment.Config.CatchUpMsr.Start()
+			// NOTE (Gus): only start the catch-up clock when this follower's ack is
+			// actually required for quorum right now — skip routine reject/replicate
+			// blips that don't block commit progress.
+			if experiment.Config.IsMeasureFollowerCatchUpEnabled && r.followerAckRequiredForQuorum(m.GetFrom()) {
+				experiment.Config.CatchUpMsr.Start(m.GetFrom())
 			}
 
 			// RejectHint is the suggested next base entry for appending (i.e.
@@ -1578,11 +1587,28 @@ func stepLeader(r *raft, m *pb.Message) error {
 					pr.Inflights.FreeLE(m.GetIndex())
 				}
 
+				// NOTE (Gus): a progress update for one follower can resolve criticality for
+				// another in-flight measurement (e.g. this follower's ack alone restores
+				// quorum) — cancel those without recording, since they weren't caught up by
+				// their own catch-up.
+				if experiment.Config.IsMeasureFollowerCatchUpEnabled {
+					for _, id := range experiment.Config.CatchUpMsr.ActiveFollowers() {
+						if id != m.GetFrom() && !r.followerAckRequiredForQuorum(id) {
+							experiment.Config.CatchUpMsr.Cancel(id)
+						}
+					}
+				}
+
 				if r.maybeCommit() {
 					// committed index has progressed for the term, so it is safe
 					// to respond to pending read index requests
 					releasePendingReadIndexMessages(r)
 					r.bcastAppend()
+
+					// NOTE (Gus): maybe signal end of measure — commit just crossed quorum
+					// and this branch's only progress mutation was m.GetFrom()'s, so a true
+					// maybeCommit() here is always attributable to this follower's ack.
+					r.maybeEndCatchUpMeasurement(m, pr)
 				} else if r.id != m.GetFrom() && pr.CanBumpCommit(r.raftLog.committed) {
 					// This node may be missing the latest commit index, so send it.
 					// NB: this is not strictly necessary because the periodic heartbeat
@@ -1601,10 +1627,6 @@ func stepLeader(r *raft, m *pb.Message) error {
 					for r.maybeSendAppend(m.GetFrom(), false /* sendIfEmpty */) {
 					}
 				}
-
-				// NOTE (Gus): maybe signal end of measure, in case follower was already
-				// recovered to latest state
-				r.maybeEndCatchUpMeasurement(m, pr)
 
 				// Transfer leadership is in progress.
 				if m.GetFrom() == r.leadTransferee && pr.Match == r.raftLog.lastIndex() {
@@ -2210,40 +2232,40 @@ func sendMsgReadIndexResponse(r *raft, m *pb.Message) {
 	}
 }
 
-// NOTE (Gus): describe...
+// NOTE (Gus): ends the quorum-critical catch-up measurement for the follower
+// that sent m, if one is in flight. Called only from the branch where
+// maybeCommit() just returned true, so this is the earliest point at which a
+// pending client request could get a reply again.
 func (r *raft) maybeEndCatchUpMeasurement(m *pb.Message, pr *tracker.Progress) {
 	if !experiment.Config.IsMeasureFollowerCatchUpEnabled || experiment.Config.CatchUpMsr == nil {
 		return
 	}
-	if pr.State != tracker.StateReplicate {
-		return
-	}
-	lastIndex := r.raftLog.lastIndex()
-	if pr.Match != lastIndex {
-		return
-	}
-	if pr.Inflights.Count() != 0 {
+	// NOTE (Gus): only this follower's own quorum-critical measurement (if any)
+	// should be ended here — a commit crossing quorum for an untracked follower
+	// isn't a catch-up we started measuring.
+	if !experiment.Config.CatchUpMsr.IsActive(m.GetFrom()) {
 		return
 	}
 
 	if experiment.Config.IsMeasureFollowerCatchUpDebugEnabled {
+		lastIndex := r.raftLog.lastIndex()
 		firstIndex := r.raftLog.firstIndex()
 		var logEntries uint64
 		if lastIndex >= firstIndex {
 			logEntries = lastIndex - firstIndex + 1
 		}
 
-		experiment.Config.CatchUpMsr.EndDebug(experiment.CatchUpDebugInfo{
+		experiment.Config.CatchUpMsr.EndDebug(m.GetFrom(), experiment.CatchUpDebugInfo{
+			FollowerID:       m.GetFrom(),
 			LogEntries:       logEntries,
-			LeaderFirstIndex: r.raftLog.firstIndex(),
+			LeaderFirstIndex: firstIndex,
 			LeaderLastIndex:  lastIndex,
 			LeaderCommitted:  r.raftLog.committed,
 			LeaderApplied:    r.raftLog.applied,
 			FollowerMatch:    pr.Match,
 			FollowerNext:     pr.Next,
-			Message:          m.String(),
 		})
 		return
 	}
-	experiment.Config.CatchUpMsr.End()
+	experiment.Config.CatchUpMsr.End(m.GetFrom())
 }

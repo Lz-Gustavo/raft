@@ -180,6 +180,29 @@ func (p *ProgressTracker) Committed() uint64 {
 	return uint64(p.Voters.CommittedIndex(matchAckIndexer(p.Progress)))
 }
 
+// NOTE (Gus): wraps matchAckIndexer but reports the excluded voter as having
+// acked nothing, so CommittedIndex can answer "what would be committed
+// without this voter's ack" using the real (unreduced) quorum size.
+type excludingIndexer struct {
+	matchAckIndexer
+	excluded uint64
+}
+
+// NOTE (Gus): see excludingIndexer above.
+func (l excludingIndexer) AckedIndex(id uint64) (quorum.Index, bool) {
+	if id == l.excluded {
+		return 0, false
+	}
+	return l.matchAckIndexer.AckedIndex(id)
+}
+
+// NOTE (Gus): CommittedWithout returns the committed index the tracker would
+// report if voter id's acknowledgement were not counted. Used to determine
+// whether id's ack is currently required for quorum (catch-up measurement).
+func (p *ProgressTracker) CommittedWithout(id uint64) uint64 {
+	return uint64(p.Voters.CommittedIndex(excludingIndexer{matchAckIndexer(p.Progress), id}))
+}
+
 // Visit invokes the supplied closure for all tracked progresses in stable order.
 func (p *ProgressTracker) Visit(f func(id uint64, pr *Progress)) {
 	n := len(p.Progress)
