@@ -26,6 +26,14 @@ const (
 	// measurements to help inspect log replication during recovery.
 	MeasureFollowerCatchUpDebugEnabled = "RAFT_MEASURE_FOLLOWER_CATCHUP_DEBUG_ENABLED"
 
+	// MeasureFollowerCatchUpPeerSilence is how long another voter must stay silent before
+	// an in-flight catch-up is considered a recovery from a real peer failure, and thus
+	// worth recording. It must sit above the longest gap a healthy follower can leave
+	// (one heartbeat interval plus its round-trip time) and below the recovery duration
+	// being measured, otherwise either a routine hiccup or a later steady-state episode
+	// is recorded in place of the real one.
+	MeasureFollowerCatchUpPeerSilence = "RAFT_MEASURE_FOLLOWER_CATCHUP_PEER_SILENCE"
+
 	// BeelogCatchUpEnabled enables the usage of a compacted in-memory state to serve delayed
 	// replicas during catch-up phase.
 	BeelogCatchUpEnabled = "RAFT_BEELOG_CATCHUP_ENABLED"
@@ -64,6 +72,13 @@ const (
 	defaultFollowerCatchUpFilename   = "/tmp/follower-catchup-time.out"
 	defaultEtcdThroughputFilename    = "/tmp/etcd-throughput.out"
 	defaultEtcdClusterStatusFilename = "/tmp/etcd-cluster-status.out"
+
+	// NOTE (Gus): one and a half heartbeat intervals of the default 500ms value used on
+	// all experiments, which is the longest a healthy follower can stay quiet once its
+	// inflights fill up and only heartbeats reach it. Must be retuned along with
+	// ETCD_HEARTBEAT_INTERVAL, and stays useful only while shorter than the recovery it
+	// is meant to catch.
+	defaultFollowerCatchUpPeerSilence = 750 * time.Millisecond
 )
 
 var Config = ExpConfig{}
@@ -114,7 +129,8 @@ func LoadEnvConfig() {
 			fn = defaultFollowerCatchUpFilename
 		}
 
-		Config.CatchUpMsr, err = NewCatchUpMsr(fn)
+		silence := parseEnvDuration(MeasureFollowerCatchUpPeerSilence, defaultFollowerCatchUpPeerSilence)
+		Config.CatchUpMsr, err = NewCatchUpMsr(fn, silence)
 		if err != nil {
 			log.Fatalln(err)
 		}
@@ -154,6 +170,21 @@ func LoadEnvConfig() {
 		}
 		Config.EtcdClusterStatusFilename = fn
 	}
+}
+
+// NOTE (Gus): unlike the other duration configs this one falls back to def instead of
+// exiting, since it is an optional tuning knob rather than a required setting.
+func parseEnvDuration(env string, def time.Duration) time.Duration {
+	raw, exists := os.LookupEnv(env)
+	if !exists {
+		return def
+	}
+
+	val, err := time.ParseDuration(raw)
+	if err != nil {
+		return def
+	}
+	return val
 }
 
 func parseEnvBool(env string) bool {

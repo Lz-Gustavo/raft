@@ -795,6 +795,48 @@ func (r *raft) followerAckRequiredForQuorum(id uint64) bool {
 	return r.trk.CommittedWithout(id) < r.raftLog.lastIndex()
 }
 
+// NOTE (Gus): records that voter id is alive and reassesses the peer-silence gate of its
+// in-flight catch-up episode, if any. Called on every response the leader steps.
+func (r *raft) markCatchUpResponse(id uint64) {
+	cm := experiment.Config.CatchUpMsr
+	if !experiment.Config.IsMeasureFollowerCatchUpEnabled || cm == nil || cm.IsDisarmed() {
+		return
+	}
+
+	cm.MarkResponse(id)
+	r.maybePromoteCatchUpMeasurement(id)
+}
+
+// NOTE (Gus): promotes the in-flight episode of follower id as soon as some other voter
+// has gone silent past the configured threshold — the only available signal that this
+// catch-up is driven by a real peer failure rather than by routine replication jitter,
+// since the quorum math alone makes every voter momentarily load-bearing whenever another
+// one lags. Reassessed on every response so the recorded start stays at the instant the
+// lag was detected instead of being pushed forward by the detection delay.
+func (r *raft) maybePromoteCatchUpMeasurement(id uint64) {
+	cm := experiment.Config.CatchUpMsr
+	if !cm.IsActive(id) {
+		return
+	}
+
+	now := time.Now().UnixNano()
+	silence := cm.SilenceThreshold().Nanoseconds()
+	for vid := range r.trk.Voters.IDs() {
+		if vid == id || vid == r.id {
+			continue
+		}
+
+		// NOTE (Gus): a voter never heard from is no evidence of failure, otherwise every
+		// peer looks dead right after the leader starts up and the first trivial episode
+		// would burn the single-shot measurement.
+		last, ok := cm.LastResponse(vid)
+		if !ok || now-last <= silence {
+			continue
+		}
+		cm.Promote(id, last)
+	}
+}
+
 func (r *raft) reset(term uint64) {
 	if r.Term != term {
 		r.Term = term
@@ -1412,15 +1454,17 @@ func stepLeader(r *raft, m *pb.Message) error {
 		// an MsgAppResp to acknowledge the appended entries in the last Ready.
 
 		pr.RecentActive = true
+		r.markCatchUpResponse(m.GetFrom())
 
 		// NOTE (Gus): here it identifies the lagged replica, must measure delay
 		// starting here
 		if m.GetReject() {
 			// NOTE (Gus): only start the catch-up clock when this follower's ack is
 			// actually required for quorum right now — skip routine reject/replicate
-			// blips that don't block commit progress.
+			// blips that don't block commit progress. The leader's tip is snapshotted
+			// along with it, as the backlog the replication phase later waits on.
 			if experiment.Config.IsMeasureFollowerCatchUpEnabled && r.followerAckRequiredForQuorum(m.GetFrom()) {
-				experiment.Config.CatchUpMsr.Start(m.GetFrom())
+				experiment.Config.CatchUpMsr.Start(m.GetFrom(), r.raftLog.lastIndex())
 			}
 
 			// RejectHint is the suggested next base entry for appending (i.e.
@@ -1608,7 +1652,7 @@ func stepLeader(r *raft, m *pb.Message) error {
 					// NOTE (Gus): maybe signal end of measure — commit just crossed quorum
 					// and this branch's only progress mutation was m.GetFrom()'s, so a true
 					// maybeCommit() here is always attributable to this follower's ack.
-					r.maybeEndCatchUpMeasurement(m, pr)
+					r.maybeEndCatchUpRecovery(m, pr)
 				} else if r.id != m.GetFrom() && pr.CanBumpCommit(r.raftLog.committed) {
 					// This node may be missing the latest commit index, so send it.
 					// NB: this is not strictly necessary because the periodic heartbeat
@@ -1616,6 +1660,12 @@ func stepLeader(r *raft, m *pb.Message) error {
 					// may arrive earlier than the next heartbeat fires.
 					r.sendAppend(m.GetFrom())
 				}
+
+				// NOTE (Gus): the follower can reach the snapshotted backlog target on a
+				// response that does not advance the commit index, so this check must sit
+				// outside the maybeCommit branch above.
+				r.maybeEndCatchUpReplication(m, pr)
+
 				// We've updated flow control information above, which may
 				// allow us to send multiple (size-limited) in-flight messages
 				// at once (such as when transitioning from probe to
@@ -1638,6 +1688,7 @@ func stepLeader(r *raft, m *pb.Message) error {
 	case pb.MsgHeartbeatResp:
 		pr.RecentActive = true
 		pr.MsgAppFlowPaused = false
+		r.markCatchUpResponse(m.GetFrom())
 
 		// NB: if the follower is paused (full Inflights), this will still send an
 		// empty append, allowing it to recover from situations in which all the
@@ -2232,40 +2283,72 @@ func sendMsgReadIndexResponse(r *raft, m *pb.Message) {
 	}
 }
 
-// NOTE (Gus): ends the quorum-critical catch-up measurement for the follower
-// that sent m, if one is in flight. Called only from the branch where
+// NOTE (Gus): ends the recovery phase of the quorum-critical catch-up measurement for the
+// follower that sent m, if one is in flight. Called only from the branch where
 // maybeCommit() just returned true, so this is the earliest point at which a
-// pending client request could get a reply again.
-func (r *raft) maybeEndCatchUpMeasurement(m *pb.Message, pr *tracker.Progress) {
-	if !experiment.Config.IsMeasureFollowerCatchUpEnabled || experiment.Config.CatchUpMsr == nil {
+// pending client request could get a reply again. The episode itself lives on to keep
+// timing the replication of its backlog.
+func (r *raft) maybeEndCatchUpRecovery(m *pb.Message, pr *tracker.Progress) {
+	cm := experiment.Config.CatchUpMsr
+	if !experiment.Config.IsMeasureFollowerCatchUpEnabled || cm == nil {
 		return
 	}
 	// NOTE (Gus): only this follower's own quorum-critical measurement (if any)
 	// should be ended here — a commit crossing quorum for an untracked follower
 	// isn't a catch-up we started measuring.
-	if !experiment.Config.CatchUpMsr.IsActive(m.GetFrom()) {
+	target, ok := cm.Target(m.GetFrom())
+	if !ok {
 		return
 	}
 
-	if experiment.Config.IsMeasureFollowerCatchUpDebugEnabled {
-		lastIndex := r.raftLog.lastIndex()
-		firstIndex := r.raftLog.firstIndex()
-		var logEntries uint64
-		if lastIndex >= firstIndex {
-			logEntries = lastIndex - firstIndex + 1
-		}
-
-		experiment.Config.CatchUpMsr.EndDebug(m.GetFrom(), experiment.CatchUpDebugInfo{
-			FollowerID:       m.GetFrom(),
-			LogEntries:       logEntries,
-			LeaderFirstIndex: firstIndex,
-			LeaderLastIndex:  lastIndex,
-			LeaderCommitted:  r.raftLog.committed,
-			LeaderApplied:    r.raftLog.applied,
-			FollowerMatch:    pr.Match,
-			FollowerNext:     pr.Next,
-		})
+	if experiment.Config.IsMeasureFollowerCatchUpDebugEnabled && cm.IsPromoted(m.GetFrom()) {
+		cm.EndRecoveryDebug(m.GetFrom(), r.catchUpDebugInfo(m.GetFrom(), target, pr))
 		return
 	}
-	experiment.Config.CatchUpMsr.End(m.GetFrom())
+	cm.EndRecovery(m.GetFrom())
+}
+
+// NOTE (Gus): ends the replication phase of the catch-up measurement, timed from the same
+// instant as the recovery phase, once the follower replicated the whole backlog that had
+// piled up when its lag was detected. Convergence with the leader's current tip is
+// deliberately not the condition: under sustained load the tip keeps advancing and a
+// delayed follower never reaches it, so the target index snapshotted at Start is used.
+func (r *raft) maybeEndCatchUpReplication(m *pb.Message, pr *tracker.Progress) {
+	cm := experiment.Config.CatchUpMsr
+	if !experiment.Config.IsMeasureFollowerCatchUpEnabled || cm == nil {
+		return
+	}
+	target, ok := cm.Target(m.GetFrom())
+	if !ok || pr.Match < target {
+		return
+	}
+
+	if experiment.Config.IsMeasureFollowerCatchUpDebugEnabled && cm.IsPromoted(m.GetFrom()) {
+		cm.EndReplicationDebug(m.GetFrom(), r.catchUpDebugInfo(m.GetFrom(), target, pr))
+		return
+	}
+	cm.EndReplication(m.GetFrom())
+}
+
+// NOTE (Gus): snapshot of the leader and follower log state to append to a recorded
+// catch-up line when the debug config is on.
+func (r *raft) catchUpDebugInfo(id uint64, target uint64, pr *tracker.Progress) experiment.CatchUpDebugInfo {
+	lastIndex := r.raftLog.lastIndex()
+	firstIndex := r.raftLog.firstIndex()
+	var logEntries uint64
+	if lastIndex >= firstIndex {
+		logEntries = lastIndex - firstIndex + 1
+	}
+
+	return experiment.CatchUpDebugInfo{
+		FollowerID:       id,
+		LogEntries:       logEntries,
+		TargetIndex:      target,
+		LeaderFirstIndex: firstIndex,
+		LeaderLastIndex:  lastIndex,
+		LeaderCommitted:  r.raftLog.committed,
+		LeaderApplied:    r.raftLog.applied,
+		FollowerMatch:    pr.Match,
+		FollowerNext:     pr.Next,
+	}
 }
