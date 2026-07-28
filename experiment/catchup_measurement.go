@@ -35,10 +35,11 @@ type CatchUpDebugInfo struct {
 // into recorded output once promoted, i.e. once the peer-silence gate confirmed the
 // episode is driven by an actual peer failure and not by routine replication jitter.
 type catchUpEpisode struct {
-	startNs      int64
-	targetIndex  uint64
-	promoted     bool
-	recoveryDone bool
+	startNs            int64
+	targetIndex        uint64
+	followerStartIndex uint64
+	promoted           bool
+	recoveryDone       bool
 }
 
 type CatchUpMsr struct {
@@ -71,8 +72,11 @@ func NewCatchUpMsr(fn string, silence time.Duration) (*CatchUpMsr, error) {
 // NOTE (Gus): per-follower start; no-op if already active for id (guards against repeated
 // Start calls while probe/reject cycles continue for the same still-lagging follower), or
 // if a full episode was already recorded. targetIndex snapshots the leader's last index at
-// this instant, which is the backlog the replication phase later waits on.
-func (cm *CatchUpMsr) Start(id uint64, targetIndex uint64) {
+// this instant, which is the backlog the replication phase later waits on. followerStartIndex
+// snapshots the follower's own last index at that same instant (its RejectHint) — a lagging
+// but not down follower already holds some entries, so the real backlog it must replicate is
+// targetIndex minus this, not targetIndex itself.
+func (cm *CatchUpMsr) Start(id uint64, targetIndex uint64, followerStartIndex uint64) {
 	if cm.disarmed {
 		return
 	}
@@ -80,8 +84,9 @@ func (cm *CatchUpMsr) Start(id uint64, targetIndex uint64) {
 		return
 	}
 	cm.active[id] = &catchUpEpisode{
-		startNs:     time.Now().UnixNano(),
-		targetIndex: targetIndex,
+		startNs:            time.Now().UnixNano(),
+		targetIndex:        targetIndex,
+		followerStartIndex: followerStartIndex,
 	}
 }
 
@@ -136,6 +141,16 @@ func (cm *CatchUpMsr) Target(id uint64) (uint64, bool) {
 		return 0, false
 	}
 	return ep.targetIndex, true
+}
+
+// NOTE (Gus): the follower's own last index snapshotted when id's episode started, and
+// whether an episode is in flight at all. See the Start doc comment for why this matters.
+func (cm *CatchUpMsr) FollowerStartIndex(id uint64) (uint64, bool) {
+	ep, ok := cm.active[id]
+	if !ok {
+		return 0, false
+	}
+	return ep.followerStartIndex, true
 }
 
 // NOTE (Gus): records that voter id was heard from just now. Feeds the peer-silence gate,

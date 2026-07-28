@@ -1463,8 +1463,12 @@ func stepLeader(r *raft, m *pb.Message) error {
 			// actually required for quorum right now — skip routine reject/replicate
 			// blips that don't block commit progress. The leader's tip is snapshotted
 			// along with it, as the backlog the replication phase later waits on.
+			// RejectHint is the follower's own last index at this instant (see the
+			// comment block below) — captured too so the real backlog, targetIndex
+			// minus this, can be computed later: a lagging-but-not-down follower
+			// already holds some entries, it isn't starting from zero.
 			if experiment.Config.IsMeasureFollowerCatchUpEnabled && r.followerAckRequiredForQuorum(m.GetFrom()) {
-				experiment.Config.CatchUpMsr.Start(m.GetFrom(), r.raftLog.lastIndex())
+				experiment.Config.CatchUpMsr.Start(m.GetFrom(), r.raftLog.lastIndex(), m.GetRejectHint())
 			}
 
 			// RejectHint is the suggested next base entry for appending (i.e.
@@ -2302,7 +2306,8 @@ func (r *raft) maybeEndCatchUpRecovery(m *pb.Message, pr *tracker.Progress) {
 	}
 
 	if experiment.Config.IsMeasureFollowerCatchUpDebugEnabled && cm.IsPromoted(m.GetFrom()) {
-		cm.EndRecoveryDebug(m.GetFrom(), r.catchUpDebugInfo(m.GetFrom(), target, pr))
+		followerStart, _ := cm.FollowerStartIndex(m.GetFrom())
+		cm.EndRecoveryDebug(m.GetFrom(), r.catchUpDebugInfo(m.GetFrom(), target, followerStart, pr))
 		return
 	}
 	cm.EndRecovery(m.GetFrom())
@@ -2324,28 +2329,30 @@ func (r *raft) maybeEndCatchUpReplication(m *pb.Message, pr *tracker.Progress) {
 	}
 
 	if experiment.Config.IsMeasureFollowerCatchUpDebugEnabled && cm.IsPromoted(m.GetFrom()) {
-		cm.EndReplicationDebug(m.GetFrom(), r.catchUpDebugInfo(m.GetFrom(), target, pr))
+		followerStart, _ := cm.FollowerStartIndex(m.GetFrom())
+		cm.EndReplicationDebug(m.GetFrom(), r.catchUpDebugInfo(m.GetFrom(), target, followerStart, pr))
 		return
 	}
 	cm.EndReplication(m.GetFrom())
 }
 
 // NOTE (Gus): snapshot of the leader and follower log state to append to a recorded
-// catch-up line when the debug config is on.
-func (r *raft) catchUpDebugInfo(id uint64, target uint64, pr *tracker.Progress) experiment.CatchUpDebugInfo {
-	lastIndex := r.raftLog.lastIndex()
-	firstIndex := r.raftLog.firstIndex()
+// catch-up line when the debug config is on. LogEntries is the real backlog the follower
+// had to replicate to close this episode — target minus the follower's own last index at
+// detection time — not the leader's current log volume: a lagging-but-not-down follower
+// already held some entries, it wasn't starting from zero.
+func (r *raft) catchUpDebugInfo(id uint64, target uint64, followerStart uint64, pr *tracker.Progress) experiment.CatchUpDebugInfo {
 	var logEntries uint64
-	if lastIndex >= firstIndex {
-		logEntries = lastIndex - firstIndex + 1
+	if target >= followerStart {
+		logEntries = target - followerStart
 	}
 
 	return experiment.CatchUpDebugInfo{
 		FollowerID:       id,
 		LogEntries:       logEntries,
 		TargetIndex:      target,
-		LeaderFirstIndex: firstIndex,
-		LeaderLastIndex:  lastIndex,
+		LeaderFirstIndex: r.raftLog.firstIndex(),
+		LeaderLastIndex:  r.raftLog.lastIndex(),
 		LeaderCommitted:  r.raftLog.committed,
 		LeaderApplied:    r.raftLog.applied,
 		FollowerMatch:    pr.Match,
