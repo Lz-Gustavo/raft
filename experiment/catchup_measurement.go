@@ -73,8 +73,9 @@ func NewCatchUpMsr(fn string, silence time.Duration) (*CatchUpMsr, error) {
 // Start calls while probe/reject cycles continue for the same still-lagging follower), or
 // if a full episode was already recorded. targetIndex snapshots the leader's last index at
 // this instant, which is the backlog the replication phase later waits on. followerStartIndex
-// snapshots the follower's own last index at that same instant (its RejectHint) — a lagging
-// but not down follower already holds some entries, so the real backlog it must replicate is
+// snapshots the index this catch-up resumes from, i.e. the follower's last acknowledged one
+// (pr.Match, which the leader rewinds Next to when it handles the rejection) — a lagging but
+// not down follower already holds some entries, so the real backlog it must replicate is
 // targetIndex minus this, not targetIndex itself.
 func (cm *CatchUpMsr) Start(id uint64, targetIndex uint64, followerStartIndex uint64) {
 	if cm.disarmed {
@@ -121,6 +122,12 @@ func (cm *CatchUpMsr) IsPromoted(id uint64) bool {
 // leader observes afterwards is steady-state replication noise.
 func (cm *CatchUpMsr) IsDisarmed() bool {
 	return cm.disarmed
+}
+
+// NOTE (Gus): reports whether any episode is in flight at all. Lets the leader skip the
+// allocation ActiveFollowers() makes, on a path it walks for every response it steps.
+func (cm *CatchUpMsr) HasActive() bool {
+	return len(cm.active) > 0
 }
 
 // NOTE (Gus): snapshot of follower IDs currently being tracked, used to reassess
@@ -185,26 +192,28 @@ func (cm *CatchUpMsr) Promote(id uint64, peerLastRespNs int64) {
 
 // NOTE (Gus): closes the recovery phase — the follower is quorum-critical no more and
 // pending client requests can be replied to again. The episode itself stays in flight to
-// keep timing the replication of its backlog.
-func (cm *CatchUpMsr) EndRecovery(id uint64) {
-	cm.endRecovery(id, nil)
+// keep timing the replication of its backlog. endNs is the instant the phase ended, taken
+// by the caller rather than here: recording a line fsyncs it, so a clock read at this depth
+// would charge the write of one phase to the duration of the next.
+func (cm *CatchUpMsr) EndRecovery(id uint64, endNs int64) {
+	cm.endRecovery(id, endNs, nil)
 }
 
-func (cm *CatchUpMsr) EndRecoveryDebug(id uint64, info CatchUpDebugInfo) {
-	cm.endRecovery(id, &info)
+func (cm *CatchUpMsr) EndRecoveryDebug(id uint64, endNs int64, info CatchUpDebugInfo) {
+	cm.endRecovery(id, endNs, &info)
 }
 
 // NOTE (Gus): closes the replication phase and the episode with it, disarming any further
-// measurement.
-func (cm *CatchUpMsr) EndReplication(id uint64) {
-	cm.endReplication(id, nil)
+// measurement. See EndRecovery on endNs.
+func (cm *CatchUpMsr) EndReplication(id uint64, endNs int64) {
+	cm.endReplication(id, endNs, nil)
 }
 
-func (cm *CatchUpMsr) EndReplicationDebug(id uint64, info CatchUpDebugInfo) {
-	cm.endReplication(id, &info)
+func (cm *CatchUpMsr) EndReplicationDebug(id uint64, endNs int64, info CatchUpDebugInfo) {
+	cm.endReplication(id, endNs, &info)
 }
 
-func (cm *CatchUpMsr) endRecovery(id uint64, info *CatchUpDebugInfo) {
+func (cm *CatchUpMsr) endRecovery(id uint64, endNs int64, info *CatchUpDebugInfo) {
 	ep, ok := cm.active[id]
 	if !ok || ep.recoveryDone {
 		return
@@ -216,11 +225,11 @@ func (cm *CatchUpMsr) endRecovery(id uint64, info *CatchUpDebugInfo) {
 		return
 	}
 
-	cm.record(catchupPhaseRecovery, id, ep, info)
+	cm.record(catchupPhaseRecovery, id, ep, endNs, info)
 	ep.recoveryDone = true
 }
 
-func (cm *CatchUpMsr) endReplication(id uint64, info *CatchUpDebugInfo) {
+func (cm *CatchUpMsr) endReplication(id uint64, endNs int64, info *CatchUpDebugInfo) {
 	ep, ok := cm.active[id]
 	if !ok {
 		return
@@ -234,17 +243,17 @@ func (cm *CatchUpMsr) endReplication(id uint64, info *CatchUpDebugInfo) {
 	// quorum on its behalf, so emit the pending recovery line here to keep both phases of
 	// an episode always present in the output.
 	if !ep.recoveryDone {
-		cm.record(catchupPhaseRecovery, id, ep, info)
+		cm.record(catchupPhaseRecovery, id, ep, endNs, info)
 		ep.recoveryDone = true
 	}
 
-	cm.record(catchupPhaseReplication, id, ep, info)
+	cm.record(catchupPhaseReplication, id, ep, endNs, info)
 	delete(cm.active, id)
 	cm.disarmed = true
 }
 
-func (cm *CatchUpMsr) record(phase string, id uint64, ep *catchUpEpisode, info *CatchUpDebugInfo) {
-	dur := time.Now().UnixNano() - ep.startNs
+func (cm *CatchUpMsr) record(phase string, id uint64, ep *catchUpEpisode, endNs int64, info *CatchUpDebugInfo) {
+	dur := endNs - ep.startNs
 
 	var err error
 	if info == nil {

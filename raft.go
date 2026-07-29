@@ -1457,20 +1457,8 @@ func stepLeader(r *raft, m *pb.Message) error {
 		r.markCatchUpResponse(m.GetFrom())
 
 		// NOTE (Gus): here it identifies the lagged replica, must measure delay
-		// starting here
+		// starting here — see the MaybeDecrTo branch below, where the episode opens.
 		if m.GetReject() {
-			// NOTE (Gus): only start the catch-up clock when this follower's ack is
-			// actually required for quorum right now — skip routine reject/replicate
-			// blips that don't block commit progress. The leader's tip is snapshotted
-			// along with it, as the backlog the replication phase later waits on.
-			// RejectHint is the follower's own last index at this instant (see the
-			// comment block below) — captured too so the real backlog, targetIndex
-			// minus this, can be computed later: a lagging-but-not-down follower
-			// already holds some entries, it isn't starting from zero.
-			if experiment.Config.IsMeasureFollowerCatchUpEnabled && r.followerAckRequiredForQuorum(m.GetFrom()) {
-				experiment.Config.CatchUpMsr.Start(m.GetFrom(), r.raftLog.lastIndex(), m.GetRejectHint())
-			}
-
 			// RejectHint is the suggested next base entry for appending (i.e.
 			// we try to append entry RejectHint+1 next), and LogTerm is the
 			// term that the follower has at index RejectHint. Older versions
@@ -1597,6 +1585,22 @@ func stepLeader(r *raft, m *pb.Message) error {
 					pr.BecomeProbe()
 				}
 
+				// NOTE (Gus): the catch-up clock opens here, and only here: MaybeDecrTo
+				// just discarded every stale rejection (a reject and a success crossing in
+				// flight), which would otherwise anchor an episode on a follower that is
+				// already being appended to and end it microseconds later on the next
+				// in-flight ack. Narrowed further to rejections that presently block commit
+				// progress, skipping routine reject/replicate blips. The leader's tip is
+				// snapshotted right before the append below goes out, as the backlog the
+				// replication phase later waits on, and pr.Match alongside it: MaybeDecrTo
+				// rewound Next to Match+1, so targetIndex minus Match — not minus the
+				// follower's own last index, which sits further ahead — is what this
+				// catch-up actually has to put on the wire.
+				if cm := experiment.Config.CatchUpMsr; experiment.Config.IsMeasureFollowerCatchUpEnabled &&
+					cm != nil && r.followerAckRequiredForQuorum(m.GetFrom()) {
+					cm.Start(m.GetFrom(), r.raftLog.lastIndex(), pr.Match)
+				}
+
 				// NOTE (Gus): sends index - 1 until if the msg is not rejected
 				// i.e. falls into the else condition bellow
 				// Then it proceeds to send the bulk of entries for the replica catch-up
@@ -1638,13 +1642,26 @@ func stepLeader(r *raft, m *pb.Message) error {
 				// NOTE (Gus): a progress update for one follower can resolve criticality for
 				// another in-flight measurement (e.g. this follower's ack alone restores
 				// quorum) — cancel those without recording, since they weren't caught up by
-				// their own catch-up.
-				if experiment.Config.IsMeasureFollowerCatchUpEnabled {
-					for _, id := range experiment.Config.CatchUpMsr.ActiveFollowers() {
+				// their own catch-up. Gated on HasActive() so the common case, no episode in
+				// flight, costs a map length check instead of a slice allocation on every
+				// response the leader steps.
+				if cm := experiment.Config.CatchUpMsr; experiment.Config.IsMeasureFollowerCatchUpEnabled &&
+					cm != nil && cm.HasActive() {
+					for _, id := range cm.ActiveFollowers() {
 						if id != m.GetFrom() && !r.followerAckRequiredForQuorum(id) {
-							experiment.Config.CatchUpMsr.Cancel(id)
+							cm.Cancel(id)
 						}
 					}
+				}
+
+				// NOTE (Gus): one end instant for both phases, taken before any of the
+				// recording I/O below: writing a line fsyncs it, and reading the clock
+				// afterwards made the replication duration absorb the cost of persisting the
+				// recovery one. When a single ack closes both phases they now coincide
+				// exactly, instead of differing by an fsync.
+				var catchUpEndNs int64
+				if experiment.Config.IsMeasureFollowerCatchUpEnabled {
+					catchUpEndNs = time.Now().UnixNano()
 				}
 
 				if r.maybeCommit() {
@@ -1656,7 +1673,7 @@ func stepLeader(r *raft, m *pb.Message) error {
 					// NOTE (Gus): maybe signal end of measure — commit just crossed quorum
 					// and this branch's only progress mutation was m.GetFrom()'s, so a true
 					// maybeCommit() here is always attributable to this follower's ack.
-					r.maybeEndCatchUpRecovery(m, pr)
+					r.maybeEndCatchUpRecovery(m, pr, catchUpEndNs)
 				} else if r.id != m.GetFrom() && pr.CanBumpCommit(r.raftLog.committed) {
 					// This node may be missing the latest commit index, so send it.
 					// NB: this is not strictly necessary because the periodic heartbeat
@@ -1668,7 +1685,7 @@ func stepLeader(r *raft, m *pb.Message) error {
 				// NOTE (Gus): the follower can reach the snapshotted backlog target on a
 				// response that does not advance the commit index, so this check must sit
 				// outside the maybeCommit branch above.
-				r.maybeEndCatchUpReplication(m, pr)
+				r.maybeEndCatchUpReplication(m, pr, catchUpEndNs)
 
 				// We've updated flow control information above, which may
 				// allow us to send multiple (size-limited) in-flight messages
@@ -2290,9 +2307,10 @@ func sendMsgReadIndexResponse(r *raft, m *pb.Message) {
 // NOTE (Gus): ends the recovery phase of the quorum-critical catch-up measurement for the
 // follower that sent m, if one is in flight. Called only from the branch where
 // maybeCommit() just returned true, so this is the earliest point at which a
-// pending client request could get a reply again. The episode itself lives on to keep
-// timing the replication of its backlog.
-func (r *raft) maybeEndCatchUpRecovery(m *pb.Message, pr *tracker.Progress) {
+// pending client request could get a reply again. endNs is the instant that ack was
+// stepped, sampled by the caller before any recording I/O. The episode itself lives on to
+// keep timing the replication of its backlog.
+func (r *raft) maybeEndCatchUpRecovery(m *pb.Message, pr *tracker.Progress, endNs int64) {
 	cm := experiment.Config.CatchUpMsr
 	if !experiment.Config.IsMeasureFollowerCatchUpEnabled || cm == nil {
 		return
@@ -2307,10 +2325,10 @@ func (r *raft) maybeEndCatchUpRecovery(m *pb.Message, pr *tracker.Progress) {
 
 	if experiment.Config.IsMeasureFollowerCatchUpDebugEnabled && cm.IsPromoted(m.GetFrom()) {
 		followerStart, _ := cm.FollowerStartIndex(m.GetFrom())
-		cm.EndRecoveryDebug(m.GetFrom(), r.catchUpDebugInfo(m.GetFrom(), target, followerStart, pr))
+		cm.EndRecoveryDebug(m.GetFrom(), endNs, r.catchUpDebugInfo(m.GetFrom(), target, followerStart, pr))
 		return
 	}
-	cm.EndRecovery(m.GetFrom())
+	cm.EndRecovery(m.GetFrom(), endNs)
 }
 
 // NOTE (Gus): ends the replication phase of the catch-up measurement, timed from the same
@@ -2318,7 +2336,9 @@ func (r *raft) maybeEndCatchUpRecovery(m *pb.Message, pr *tracker.Progress) {
 // piled up when its lag was detected. Convergence with the leader's current tip is
 // deliberately not the condition: under sustained load the tip keeps advancing and a
 // delayed follower never reaches it, so the target index snapshotted at Start is used.
-func (r *raft) maybeEndCatchUpReplication(m *pb.Message, pr *tracker.Progress) {
+// endNs is the same instant handed to maybeEndCatchUpRecovery, so an ack that closes both
+// phases yields two identical durations rather than one inflated by the other's fsync.
+func (r *raft) maybeEndCatchUpReplication(m *pb.Message, pr *tracker.Progress, endNs int64) {
 	cm := experiment.Config.CatchUpMsr
 	if !experiment.Config.IsMeasureFollowerCatchUpEnabled || cm == nil {
 		return
@@ -2330,10 +2350,10 @@ func (r *raft) maybeEndCatchUpReplication(m *pb.Message, pr *tracker.Progress) {
 
 	if experiment.Config.IsMeasureFollowerCatchUpDebugEnabled && cm.IsPromoted(m.GetFrom()) {
 		followerStart, _ := cm.FollowerStartIndex(m.GetFrom())
-		cm.EndReplicationDebug(m.GetFrom(), r.catchUpDebugInfo(m.GetFrom(), target, followerStart, pr))
+		cm.EndReplicationDebug(m.GetFrom(), endNs, r.catchUpDebugInfo(m.GetFrom(), target, followerStart, pr))
 		return
 	}
-	cm.EndReplication(m.GetFrom())
+	cm.EndReplication(m.GetFrom(), endNs)
 }
 
 // NOTE (Gus): snapshot of the leader and follower log state to append to a recorded
