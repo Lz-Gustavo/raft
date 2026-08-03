@@ -31,32 +31,38 @@ type CatchUpDebugInfo struct {
 	FollowerNext     uint64
 }
 
-// NOTE (Gus): a single in-flight catch-up episode for one follower. It is only turned
-// into recorded output once promoted, i.e. once the peer-silence gate confirmed the
-// episode is driven by an actual peer failure and not by routine replication jitter.
+// NOTE (Gus): a single in-flight catch-up episode for one follower.
 type catchUpEpisode struct {
 	startNs            int64
 	targetIndex        uint64
 	followerStartIndex uint64
-	promoted           bool
 	recoveryDone       bool
 }
 
+// NOTE (Gus): the measurement records the *first* complete episode of each follower and
+// nothing more for that follower. It deliberately makes no attempt to decide which episode
+// was caused by the injected failure: the leader cannot know that, and the liveness
+// heuristic that used to try (a peer-silence threshold gating a single global shot) got it
+// wrong. Load onset provokes a probe/reject cycle on a healthy follower seconds before any
+// failure is injected, and under a global latch that early artifact consumed the one
+// recording slot and hid the real episode entirely.
+//
+// Keying by follower removes the race: an artifact on one follower is recorded under that
+// follower's ID and leaves every other follower's slot intact. Which episode is the real
+// one is then decided during analysis, from the recorded startNs and the experiment's own
+// kill schedule — information the leader does not have.
 type CatchUpMsr struct {
 	active   map[uint64]*catchUpEpisode
-	lastResp map[uint64]int64
-	silence  time.Duration
-	disarmed bool
+	recorded map[uint64]bool
 
 	buff *bytes.Buffer
 	file *os.File
 }
 
-func NewCatchUpMsr(fn string, silence time.Duration) (*CatchUpMsr, error) {
+func NewCatchUpMsr(fn string) (*CatchUpMsr, error) {
 	cm := &CatchUpMsr{
 		active:   make(map[uint64]*catchUpEpisode),
-		lastResp: make(map[uint64]int64),
-		silence:  silence,
+		recorded: make(map[uint64]bool),
 		buff:     &bytes.Buffer{},
 	}
 
@@ -71,14 +77,14 @@ func NewCatchUpMsr(fn string, silence time.Duration) (*CatchUpMsr, error) {
 
 // NOTE (Gus): per-follower start; no-op if already active for id (guards against repeated
 // Start calls while probe/reject cycles continue for the same still-lagging follower), or
-// if a full episode was already recorded. targetIndex snapshots the leader's last index at
+// if id already had an episode recorded. targetIndex snapshots the leader's last index at
 // this instant, which is the backlog the replication phase later waits on. followerStartIndex
 // snapshots the index this catch-up resumes from, i.e. the follower's last acknowledged one
 // (pr.Match, which the leader rewinds Next to when it handles the rejection) — a lagging but
 // not down follower already holds some entries, so the real backlog it must replicate is
 // targetIndex minus this, not targetIndex itself.
 func (cm *CatchUpMsr) Start(id uint64, targetIndex uint64, followerStartIndex uint64) {
-	if cm.disarmed {
+	if cm.recorded[id] {
 		return
 	}
 	if _, ok := cm.active[id]; ok {
@@ -110,18 +116,10 @@ func (cm *CatchUpMsr) IsActive(id uint64) bool {
 	return ok
 }
 
-// NOTE (Gus): reports whether the in-flight episode of follower id already cleared the
-// peer-silence gate, and is therefore going to produce output.
-func (cm *CatchUpMsr) IsPromoted(id uint64) bool {
-	ep, ok := cm.active[id]
-	return ok && ep.promoted
-}
-
-// NOTE (Gus): reports whether a complete episode was already recorded. The measurement is
-// single-shot: the experiment injects exactly one failure per run, and everything the
-// leader observes afterwards is steady-state replication noise.
-func (cm *CatchUpMsr) IsDisarmed() bool {
-	return cm.disarmed
+// NOTE (Gus): reports whether follower id already had an episode recorded, and is
+// therefore done contributing to this run's output.
+func (cm *CatchUpMsr) IsRecorded(id uint64) bool {
+	return cm.recorded[id]
 }
 
 // NOTE (Gus): reports whether any episode is in flight at all. Lets the leader skip the
@@ -160,36 +158,6 @@ func (cm *CatchUpMsr) FollowerStartIndex(id uint64) (uint64, bool) {
 	return ep.followerStartIndex, true
 }
 
-// NOTE (Gus): records that voter id was heard from just now. Feeds the peer-silence gate,
-// which is the only signal able to tell a genuine failure apart from a follower that is
-// merely lagging — the quorum math alone cannot, since with one chronically delayed voter
-// every other voter is momentarily load-bearing at all times.
-func (cm *CatchUpMsr) MarkResponse(id uint64) {
-	cm.lastResp[id] = time.Now().UnixNano()
-}
-
-// NOTE (Gus): last instant voter id was heard from, false if never.
-func (cm *CatchUpMsr) LastResponse(id uint64) (int64, bool) {
-	ts, ok := cm.lastResp[id]
-	return ts, ok
-}
-
-func (cm *CatchUpMsr) SilenceThreshold() time.Duration {
-	return cm.silence
-}
-
-// NOTE (Gus): marks id's in-flight episode as worth recording, peerLastRespNs being the
-// last time the silent voter was heard from. The episode must have started after that
-// instant: an older episode belongs to the healthy window that preceded the failure, and
-// recording it would both backdate the start and burn the single-shot measurement.
-func (cm *CatchUpMsr) Promote(id uint64, peerLastRespNs int64) {
-	ep, ok := cm.active[id]
-	if !ok || ep.promoted || ep.startNs < peerLastRespNs {
-		return
-	}
-	ep.promoted = true
-}
-
 // NOTE (Gus): closes the recovery phase — the follower is quorum-critical no more and
 // pending client requests can be replied to again. The episode itself stays in flight to
 // keep timing the replication of its backlog. endNs is the instant the phase ended, taken
@@ -203,8 +171,8 @@ func (cm *CatchUpMsr) EndRecoveryDebug(id uint64, endNs int64, info CatchUpDebug
 	cm.endRecovery(id, endNs, &info)
 }
 
-// NOTE (Gus): closes the replication phase and the episode with it, disarming any further
-// measurement. See EndRecovery on endNs.
+// NOTE (Gus): closes the replication phase and the episode with it, retiring this follower
+// from any further measurement. See EndRecovery on endNs.
 func (cm *CatchUpMsr) EndReplication(id uint64, endNs int64) {
 	cm.endReplication(id, endNs, nil)
 }
@@ -218,24 +186,19 @@ func (cm *CatchUpMsr) endRecovery(id uint64, endNs int64, info *CatchUpDebugInfo
 	if !ok || ep.recoveryDone {
 		return
 	}
-	// NOTE (Gus): an episode that never cleared the peer-silence gate is dropped
-	// silently, freeing id to open a fresh one on its next quorum-critical rejection.
-	if !ep.promoted || cm.disarmed {
-		delete(cm.active, id)
-		return
-	}
 
 	cm.record(catchupPhaseRecovery, id, ep, endNs, info)
 	ep.recoveryDone = true
+
+	// NOTE (Gus): id is spent as soon as it emitted anything, even though the episode
+	// lives on to time its replication. A follower whose backlog is never fully replicated
+	// would otherwise be free to open a second episode and record a second recovery line.
+	cm.recorded[id] = true
 }
 
 func (cm *CatchUpMsr) endReplication(id uint64, endNs int64, info *CatchUpDebugInfo) {
 	ep, ok := cm.active[id]
 	if !ok {
-		return
-	}
-	if !ep.promoted || cm.disarmed {
-		delete(cm.active, id)
 		return
 	}
 
@@ -249,7 +212,7 @@ func (cm *CatchUpMsr) endReplication(id uint64, endNs int64, info *CatchUpDebugI
 
 	cm.record(catchupPhaseReplication, id, ep, endNs, info)
 	delete(cm.active, id)
-	cm.disarmed = true
+	cm.recorded[id] = true
 }
 
 func (cm *CatchUpMsr) record(phase string, id uint64, ep *catchUpEpisode, endNs int64, info *CatchUpDebugInfo) {

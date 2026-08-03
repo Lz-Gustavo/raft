@@ -795,48 +795,6 @@ func (r *raft) followerAckRequiredForQuorum(id uint64) bool {
 	return r.trk.CommittedWithout(id) < r.raftLog.lastIndex()
 }
 
-// NOTE (Gus): records that voter id is alive and reassesses the peer-silence gate of its
-// in-flight catch-up episode, if any. Called on every response the leader steps.
-func (r *raft) markCatchUpResponse(id uint64) {
-	cm := experiment.Config.CatchUpMsr
-	if !experiment.Config.IsMeasureFollowerCatchUpEnabled || cm == nil || cm.IsDisarmed() {
-		return
-	}
-
-	cm.MarkResponse(id)
-	r.maybePromoteCatchUpMeasurement(id)
-}
-
-// NOTE (Gus): promotes the in-flight episode of follower id as soon as some other voter
-// has gone silent past the configured threshold — the only available signal that this
-// catch-up is driven by a real peer failure rather than by routine replication jitter,
-// since the quorum math alone makes every voter momentarily load-bearing whenever another
-// one lags. Reassessed on every response so the recorded start stays at the instant the
-// lag was detected instead of being pushed forward by the detection delay.
-func (r *raft) maybePromoteCatchUpMeasurement(id uint64) {
-	cm := experiment.Config.CatchUpMsr
-	if !cm.IsActive(id) {
-		return
-	}
-
-	now := time.Now().UnixNano()
-	silence := cm.SilenceThreshold().Nanoseconds()
-	for vid := range r.trk.Voters.IDs() {
-		if vid == id || vid == r.id {
-			continue
-		}
-
-		// NOTE (Gus): a voter never heard from is no evidence of failure, otherwise every
-		// peer looks dead right after the leader starts up and the first trivial episode
-		// would burn the single-shot measurement.
-		last, ok := cm.LastResponse(vid)
-		if !ok || now-last <= silence {
-			continue
-		}
-		cm.Promote(id, last)
-	}
-}
-
 func (r *raft) reset(term uint64) {
 	if r.Term != term {
 		r.Term = term
@@ -1454,7 +1412,6 @@ func stepLeader(r *raft, m *pb.Message) error {
 		// an MsgAppResp to acknowledge the appended entries in the last Ready.
 
 		pr.RecentActive = true
-		r.markCatchUpResponse(m.GetFrom())
 
 		// NOTE (Gus): here it identifies the lagged replica, must measure delay
 		// starting here — see the MaybeDecrTo branch below, where the episode opens.
@@ -1709,7 +1666,6 @@ func stepLeader(r *raft, m *pb.Message) error {
 	case pb.MsgHeartbeatResp:
 		pr.RecentActive = true
 		pr.MsgAppFlowPaused = false
-		r.markCatchUpResponse(m.GetFrom())
 
 		// NB: if the follower is paused (full Inflights), this will still send an
 		// empty append, allowing it to recover from situations in which all the
@@ -2323,7 +2279,7 @@ func (r *raft) maybeEndCatchUpRecovery(m *pb.Message, pr *tracker.Progress, endN
 		return
 	}
 
-	if experiment.Config.IsMeasureFollowerCatchUpDebugEnabled && cm.IsPromoted(m.GetFrom()) {
+	if experiment.Config.IsMeasureFollowerCatchUpDebugEnabled {
 		followerStart, _ := cm.FollowerStartIndex(m.GetFrom())
 		cm.EndRecoveryDebug(m.GetFrom(), endNs, r.catchUpDebugInfo(m.GetFrom(), target, followerStart, pr))
 		return
@@ -2348,7 +2304,7 @@ func (r *raft) maybeEndCatchUpReplication(m *pb.Message, pr *tracker.Progress, e
 		return
 	}
 
-	if experiment.Config.IsMeasureFollowerCatchUpDebugEnabled && cm.IsPromoted(m.GetFrom()) {
+	if experiment.Config.IsMeasureFollowerCatchUpDebugEnabled {
 		followerStart, _ := cm.FollowerStartIndex(m.GetFrom())
 		cm.EndReplicationDebug(m.GetFrom(), endNs, r.catchUpDebugInfo(m.GetFrom(), target, followerStart, pr))
 		return

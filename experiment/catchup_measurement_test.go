@@ -16,8 +16,6 @@ import (
 const (
 	follower2 = uint64(2)
 	follower3 = uint64(3)
-
-	testSilence = 50 * time.Millisecond
 )
 
 // newTestMsr returns a measurer writing to a temporary file, along with a reader closing
@@ -26,7 +24,7 @@ func newTestMsr(t *testing.T) (*experiment.CatchUpMsr, func() []string) {
 	t.Helper()
 
 	fn := filepath.Join(t.TempDir(), "test-measurement.out")
-	cm, err := experiment.NewCatchUpMsr(fn, testSilence)
+	cm, err := experiment.NewCatchUpMsr(fn)
 	require.NoError(t, err, "NewCatchUpMsr() failed")
 	t.Cleanup(cm.Close)
 
@@ -62,19 +60,22 @@ func parseLine(t *testing.T, line string) (phase string, id uint64, startNs, dur
 	return fields[0], id, startNs, durNs
 }
 
+// idsOf collects the follower each recorded line belongs to, in file order.
+func idsOf(t *testing.T, lines []string) []uint64 {
+	t.Helper()
+
+	ids := make([]uint64, 0, len(lines))
+	for _, line := range lines {
+		_, id, _, _ := parseLine(t, line)
+		ids = append(ids, id)
+	}
+	return ids
+}
+
 // nowNs stands in for the end instant stepLeader samples once per response, before any of
 // the recording I/O, and hands to both phase ends.
 func nowNs() int64 {
 	return time.Now().UnixNano()
-}
-
-// promotedStart opens an episode for id and clears the peer-silence gate for it, standing
-// in for what stepLeader does once another voter went quiet. followerStartIndex stands in
-// for the follower's last acknowledged index (pr.Match) captured at Start.
-func promotedStart(cm *experiment.CatchUpMsr, id uint64, targetIndex uint64, followerStartIndex uint64) {
-	peerLastResp := time.Now().UnixNano()
-	cm.Start(id, targetIndex, followerStartIndex)
-	cm.Promote(id, peerLastResp)
 }
 
 func TestCatchUpMsr_Episodes(t *testing.T) {
@@ -85,19 +86,9 @@ func TestCatchUpMsr_Episodes(t *testing.T) {
 		assertions  func(*testing.T, []string)
 	}{
 		{
-			name: "episode that never cleared the peer silence gate records nothing",
+			name: "episode records both phases from a single start",
 			measurement: func(t *testing.T, cm *experiment.CatchUpMsr) {
 				cm.Start(follower2, 100, 40)
-				time.Sleep(5 * time.Millisecond)
-				cm.EndRecovery(follower2, nowNs())
-				cm.EndReplication(follower2, nowNs())
-			},
-			expectedN: 0,
-		},
-		{
-			name: "promoted episode records both phases from a single start",
-			measurement: func(t *testing.T, cm *experiment.CatchUpMsr) {
-				promotedStart(cm, follower2, 100, 40)
 				time.Sleep(5 * time.Millisecond)
 				cm.EndRecovery(follower2, nowNs())
 				time.Sleep(5 * time.Millisecond)
@@ -119,7 +110,7 @@ func TestCatchUpMsr_Episodes(t *testing.T) {
 		{
 			name: "one ack closing both phases records the same duration twice",
 			measurement: func(t *testing.T, cm *experiment.CatchUpMsr) {
-				promotedStart(cm, follower2, 100, 40)
+				cm.Start(follower2, 100, 40)
 				time.Sleep(5 * time.Millisecond)
 
 				// stepLeader samples the end instant once and hands it to both phases, so
@@ -136,54 +127,98 @@ func TestCatchUpMsr_Episodes(t *testing.T) {
 			},
 		},
 		{
-			name: "single shot, nothing is recorded after a complete episode",
+			name: "each follower records its own first episode",
 			measurement: func(t *testing.T, cm *experiment.CatchUpMsr) {
-				promotedStart(cm, follower2, 100, 40)
+				cm.Start(follower2, 100, 40)
 				cm.EndRecovery(follower2, nowNs())
 				cm.EndReplication(follower2, nowNs())
 
-				promotedStart(cm, follower3, 200, 150)
+				cm.Start(follower3, 200, 150)
 				cm.EndRecovery(follower3, nowNs())
 				cm.EndReplication(follower3, nowNs())
 			},
-			expectedN: 2,
+			expectedN: 4,
 			assertions: func(t *testing.T, lines []string) {
-				for _, line := range lines {
-					_, id, _, _ := parseLine(t, line)
-					assert.Equal(t, follower2, id, "the second episode must not be recorded")
-				}
+				assert.Equal(t, []uint64{follower2, follower2, follower3, follower3}, idsOf(t, lines))
 			},
 		},
 		{
-			name: "promote is refused for an episode older than the peer's last response",
+			// Regression test for the 4-catchup-v3 lan data: load onset provokes a
+			// probe/reject cycle on a healthy follower seconds before the failure is
+			// injected. Under the old global single-shot latch that early artifact
+			// consumed the only recording slot and the real episode on the other
+			// follower was never written.
+			name: "an early episode on one follower does not suppress a later one on another",
+			measurement: func(t *testing.T, cm *experiment.CatchUpMsr) {
+				// The artifact: follower2 opens and completes an episode first.
+				cm.Start(follower2, 100, 40)
+				cm.EndRecovery(follower2, nowNs())
+				cm.EndReplication(follower2, nowNs())
+
+				// The real event: follower3 only becomes quorum-critical later.
+				cm.Start(follower3, 5000, 1200)
+				assert.True(t, cm.IsActive(follower3), "an unrelated follower must still be measurable")
+				cm.EndRecovery(follower3, nowNs())
+				cm.EndReplication(follower3, nowNs())
+			},
+			expectedN: 4,
+			assertions: func(t *testing.T, lines []string) {
+				assert.Contains(t, idsOf(t, lines), follower3, "the later episode must be recorded")
+			},
+		},
+		{
+			name: "a second episode for an already recorded follower is not recorded",
 			measurement: func(t *testing.T, cm *experiment.CatchUpMsr) {
 				cm.Start(follower2, 100, 40)
-				time.Sleep(5 * time.Millisecond)
+				cm.EndRecovery(follower2, nowNs())
+				cm.EndReplication(follower2, nowNs())
 
-				// The peer answered after this episode began, so the episode belongs to
-				// the healthy window preceding the failure.
-				cm.Promote(follower2, time.Now().UnixNano())
+				cm.Start(follower2, 900, 850)
+				assert.False(t, cm.IsActive(follower2), "a recorded follower must not open a new episode")
 				cm.EndRecovery(follower2, nowNs())
 				cm.EndReplication(follower2, nowNs())
 			},
-			expectedN: 0,
+			expectedN: 2,
 		},
 		{
-			name: "cancel discards an unpromoted episode without consuming the single shot",
+			// The follower never reached the snapshotted target before the run ended, so
+			// only the recovery line exists. It must still retire the follower, otherwise
+			// its next quorum-critical rejection would emit a second recovery line.
+			name: "a recovery-only episode retires the follower",
+			measurement: func(t *testing.T, cm *experiment.CatchUpMsr) {
+				cm.Start(follower2, 100, 40)
+				cm.EndRecovery(follower2, nowNs())
+
+				cm.Cancel(follower2)
+				cm.Start(follower2, 900, 850)
+				cm.EndRecovery(follower2, nowNs())
+			},
+			expectedN: 1,
+			assertions: func(t *testing.T, lines []string) {
+				phase, _, _, _ := parseLine(t, lines[0])
+				assert.Equal(t, "recovery", phase)
+			},
+		},
+		{
+			name: "cancel discards an episode without retiring the follower",
 			measurement: func(t *testing.T, cm *experiment.CatchUpMsr) {
 				cm.Start(follower2, 100, 40)
 				cm.Cancel(follower2)
+				assert.False(t, cm.IsRecorded(follower2), "a cancelled episode records nothing")
 
-				promotedStart(cm, follower2, 200, 150)
+				cm.Start(follower2, 200, 150)
 				cm.EndRecovery(follower2, nowNs())
 				cm.EndReplication(follower2, nowNs())
 			},
 			expectedN: 2,
+			assertions: func(t *testing.T, lines []string) {
+				assert.Equal(t, []uint64{follower2, follower2}, idsOf(t, lines))
+			},
 		},
 		{
 			name: "cancel is a no-op once the recovery phase was recorded",
 			measurement: func(t *testing.T, cm *experiment.CatchUpMsr) {
-				promotedStart(cm, follower2, 100, 40)
+				cm.Start(follower2, 100, 40)
 				cm.EndRecovery(follower2, nowNs())
 
 				cm.Cancel(follower2)
@@ -194,7 +229,7 @@ func TestCatchUpMsr_Episodes(t *testing.T) {
 		{
 			name: "replication ending first still emits both phases",
 			measurement: func(t *testing.T, cm *experiment.CatchUpMsr) {
-				promotedStart(cm, follower2, 100, 40)
+				cm.Start(follower2, 100, 40)
 				time.Sleep(5 * time.Millisecond)
 				cm.EndReplication(follower2, nowNs())
 			},
@@ -217,7 +252,7 @@ func TestCatchUpMsr_Episodes(t *testing.T) {
 		{
 			name: "start without end",
 			measurement: func(t *testing.T, cm *experiment.CatchUpMsr) {
-				promotedStart(cm, follower2, 100, 40)
+				cm.Start(follower2, 100, 40)
 				// Don't end the episode - should not panic
 			},
 			expectedN: 0,
@@ -225,7 +260,7 @@ func TestCatchUpMsr_Episodes(t *testing.T) {
 		{
 			name: "repeated starts before end avoid overwriting the episode",
 			measurement: func(t *testing.T, cm *experiment.CatchUpMsr) {
-				promotedStart(cm, follower2, 100, 40)
+				cm.Start(follower2, 100, 40)
 				time.Sleep(10 * time.Millisecond)
 
 				// Second Start() call should be ignored due to protection, keeping the
@@ -250,25 +285,21 @@ func TestCatchUpMsr_Episodes(t *testing.T) {
 			},
 		},
 		{
-			name: "two followers are tracked independently until one completes",
+			name: "two followers are tracked concurrently and both record",
 			measurement: func(t *testing.T, cm *experiment.CatchUpMsr) {
-				promotedStart(cm, follower2, 100, 40)
-				promotedStart(cm, follower3, 200, 150)
+				cm.Start(follower2, 100, 40)
+				cm.Start(follower3, 200, 150)
+				assert.ElementsMatch(t, []uint64{follower2, follower3}, cm.ActiveFollowers())
 
 				cm.EndRecovery(follower3, nowNs())
 				cm.EndReplication(follower3, nowNs())
 
-				// follower3 disarmed the measurement, so follower2's in-flight episode is
-				// dropped instead of recorded.
 				cm.EndRecovery(follower2, nowNs())
 				cm.EndReplication(follower2, nowNs())
 			},
-			expectedN: 2,
+			expectedN: 4,
 			assertions: func(t *testing.T, lines []string) {
-				for _, line := range lines {
-					_, id, _, _ := parseLine(t, line)
-					assert.Equal(t, follower3, id)
-				}
+				assert.Equal(t, []uint64{follower3, follower3, follower2, follower2}, idsOf(t, lines))
 			},
 		},
 	}
@@ -292,8 +323,7 @@ func TestCatchUpMsr_EpisodeState(t *testing.T) {
 	cm, recorded := newTestMsr(t)
 
 	assert.False(t, cm.IsActive(follower2))
-	assert.False(t, cm.IsPromoted(follower2))
-	assert.False(t, cm.IsDisarmed())
+	assert.False(t, cm.IsRecorded(follower2))
 	assert.False(t, cm.HasActive())
 	assert.Empty(t, cm.ActiveFollowers())
 
@@ -305,7 +335,6 @@ func TestCatchUpMsr_EpisodeState(t *testing.T) {
 
 	cm.Start(follower2, 42, 20)
 	assert.True(t, cm.IsActive(follower2))
-	assert.False(t, cm.IsPromoted(follower2), "the peer silence gate has not tripped yet")
 	assert.True(t, cm.HasActive())
 	assert.ElementsMatch(t, []uint64{follower2}, cm.ActiveFollowers())
 
@@ -317,50 +346,31 @@ func TestCatchUpMsr_EpisodeState(t *testing.T) {
 	assert.True(t, ok)
 	assert.Equal(t, uint64(20), followerStart)
 
-	cm.Promote(follower2, 0)
-	assert.True(t, cm.IsPromoted(follower2))
-
 	cm.Start(follower3, 43, 21)
 	assert.ElementsMatch(t, []uint64{follower2, follower3}, cm.ActiveFollowers())
 
 	cm.Cancel(follower3)
 	assert.False(t, cm.IsActive(follower3))
+	assert.False(t, cm.IsRecorded(follower3), "a cancelled episode must not retire its follower")
 	assert.ElementsMatch(t, []uint64{follower2}, cm.ActiveFollowers())
 
 	cm.EndRecovery(follower2, nowNs())
 	assert.True(t, cm.IsActive(follower2), "the episode lives on to time its replication")
-	assert.False(t, cm.IsDisarmed())
+	assert.True(t, cm.IsRecorded(follower2), "emitting a line already retires the follower")
 
 	cm.EndReplication(follower2, nowNs())
 	assert.False(t, cm.IsActive(follower2))
-	assert.True(t, cm.IsDisarmed())
+	assert.True(t, cm.IsRecorded(follower2))
 	assert.False(t, cm.HasActive())
 	assert.Empty(t, cm.ActiveFollowers())
 
+	cm.Start(follower2, 44, 22)
+	assert.False(t, cm.IsActive(follower2), "a recorded follower must not open new episodes")
+
 	cm.Start(follower3, 44, 22)
-	assert.False(t, cm.IsActive(follower3), "a disarmed measurer must not open new episodes")
+	assert.True(t, cm.IsActive(follower3), "another follower stays measurable")
 
 	assert.Len(t, recorded(), 2)
-}
-
-func TestCatchUpMsr_ResponseTracking(t *testing.T) {
-	cm, _ := newTestMsr(t)
-
-	assert.Equal(t, testSilence, cm.SilenceThreshold())
-
-	_, ok := cm.LastResponse(follower2)
-	assert.False(t, ok, "a voter never heard from must not look silent")
-
-	before := time.Now().UnixNano()
-	cm.MarkResponse(follower2)
-
-	ts, ok := cm.LastResponse(follower2)
-	assert.True(t, ok)
-	assert.GreaterOrEqual(t, ts, before)
-
-	cm.MarkResponse(follower2)
-	next, _ := cm.LastResponse(follower2)
-	assert.GreaterOrEqual(t, next, ts, "later responses must move the timestamp forward")
 }
 
 func TestCatchUpMsr_Debug(t *testing.T) {
@@ -380,7 +390,7 @@ func TestCatchUpMsr_Debug(t *testing.T) {
 
 	// followerStartIndex of 9 mirrors info.LogEntries: 18 - 9 = 9, i.e. what
 	// catchUpDebugInfo in raft.go would compute for this target/start pair.
-	promotedStart(cm, follower2, info.TargetIndex, 9)
+	cm.Start(follower2, info.TargetIndex, 9)
 	cm.EndRecoveryDebug(follower2, nowNs(), info)
 
 	info.LeaderLastIndex = 24
