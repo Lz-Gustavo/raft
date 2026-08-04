@@ -2,6 +2,7 @@ package experiment
 
 import (
 	"log"
+	"math"
 	"os"
 	"strconv"
 	"time"
@@ -21,6 +22,16 @@ const (
 	// stored in-memory to be later persisted on MeasureFollowerCatchUpFilename file.
 	MeasureFollowerCatchUpEnabled  = "RAFT_MEASURE_FOLLOWER_CATCHUP_ENABLED"
 	MeasureFollowerCatchUpFilename = "RAFT_MEASURE_FOLLOWER_CATCHUP_FILENAME"
+
+	// MeasureFollowerCatchUpArmAt holds the absolute Unix instant, in SECONDS, before which
+	// catch-up episodes are ignored. The leader cannot tell an episode provoked by load
+	// onset from one provoked by the injected failure; the experiment harness can, since it
+	// decides when to kill a follower, so it hands the leader that instant here and every
+	// episode opening earlier is discarded as noise. Seconds because `date +%s` is then
+	// enough to produce it and the value stays readable — the window this has to land in is
+	// seconds wide, so sub-second precision would buy nothing. Unset means armed from the
+	// start, i.e. measure every episode, which is what runs not injecting a failure want.
+	MeasureFollowerCatchUpArmAt = "RAFT_MEASURE_FOLLOWER_CATCHUP_ARM_AT"
 
 	// MeasureFollowerCatchUpDebugEnabled enables extra fields in catch-up
 	// measurements to help inspect log replication during recovery.
@@ -114,7 +125,7 @@ func LoadEnvConfig() {
 			fn = defaultFollowerCatchUpFilename
 		}
 
-		Config.CatchUpMsr, err = NewCatchUpMsr(fn)
+		Config.CatchUpMsr, err = NewCatchUpMsr(fn, catchUpArmNs())
 		if err != nil {
 			log.Fatalln(err)
 		}
@@ -156,6 +167,19 @@ func LoadEnvConfig() {
 	}
 }
 
+// NOTE (Gus): the configured arm instant, converted to the ns the measurement compares
+// against time.Now().UnixNano(). Like every other tuning knob here it must never abort the
+// server: absent, unparsable, negative, or large enough to overflow the conversion all mean
+// 0, i.e. armed from the start — a measurement parameter is not worth failing a run over,
+// and the fallback is the behaviour the recorder had before arming existed.
+func catchUpArmNs() int64 {
+	sec := parseEnvInt64(MeasureFollowerCatchUpArmAt)
+	if sec <= 0 || sec > math.MaxInt64/int64(time.Second) {
+		return 0
+	}
+	return sec * int64(time.Second)
+}
+
 func parseEnvBool(env string) bool {
 	raw, exists := os.LookupEnv(env)
 	if !exists {
@@ -165,6 +189,19 @@ func parseEnvBool(env string) bool {
 	val, err := strconv.ParseBool(raw)
 	if err != nil {
 		return false
+	}
+	return val
+}
+
+func parseEnvInt64(env string) int64 {
+	raw, exists := os.LookupEnv(env)
+	if !exists {
+		return 0
+	}
+
+	val, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil {
+		return 0
 	}
 	return val
 }

@@ -39,30 +39,35 @@ type catchUpEpisode struct {
 	recoveryDone       bool
 }
 
-// NOTE (Gus): the measurement records the *first* complete episode of each follower and
-// nothing more for that follower. It deliberately makes no attempt to decide which episode
-// was caused by the injected failure: the leader cannot know that, and the liveness
-// heuristic that used to try (a peer-silence threshold gating a single global shot) got it
-// wrong. Load onset provokes a probe/reject cycle on a healthy follower seconds before any
-// failure is injected, and under a global latch that early artifact consumed the one
-// recording slot and hid the real episode entirely.
+// NOTE (Gus): the measurement records the *first* complete episode of each follower that
+// began at or after the arm instant, and nothing more for that follower. It makes no attempt
+// to decide on its own which episode was caused by the injected failure: the leader cannot
+// know that, and the liveness heuristic that used to try (a peer-silence threshold gating a
+// single global shot) got it wrong. Load onset provokes a probe/reject cycle on a healthy
+// follower seconds before any failure is injected, and under a global latch that early
+// artifact consumed the one recording slot and hid the real episode entirely.
 //
-// Keying by follower removes the race: an artifact on one follower is recorded under that
-// follower's ID and leaves every other follower's slot intact. Which episode is the real
-// one is then decided during analysis, from the recorded startNs and the experiment's own
-// kill schedule — information the leader does not have.
+// Keying by follower removes the race between followers: an artifact on one follower is
+// recorded under that follower's ID and leaves every other follower's slot intact. It does
+// not remove the race within a single follower — a load-onset episode on the node that later
+// recovers still burns that node's only slot seconds before the failure. armNs closes that:
+// the experiment harness knows when it will kill the fast follower and hands the leader that
+// instant, so every episode opening before it can be ignored as noise. Zero means armed from
+// the start, which is the behaviour of every run that does not configure it.
 type CatchUpMsr struct {
 	active   map[uint64]*catchUpEpisode
 	recorded map[uint64]bool
+	armNs    int64
 
 	buff *bytes.Buffer
 	file *os.File
 }
 
-func NewCatchUpMsr(fn string) (*CatchUpMsr, error) {
+func NewCatchUpMsr(fn string, armNs int64) (*CatchUpMsr, error) {
 	cm := &CatchUpMsr{
 		active:   make(map[uint64]*catchUpEpisode),
 		recorded: make(map[uint64]bool),
+		armNs:    armNs,
 		buff:     &bytes.Buffer{},
 	}
 
@@ -76,22 +81,33 @@ func NewCatchUpMsr(fn string) (*CatchUpMsr, error) {
 }
 
 // NOTE (Gus): per-follower start; no-op if already active for id (guards against repeated
-// Start calls while probe/reject cycles continue for the same still-lagging follower), or
-// if id already had an episode recorded. targetIndex snapshots the leader's last index at
-// this instant, which is the backlog the replication phase later waits on. followerStartIndex
-// snapshots the index this catch-up resumes from, i.e. the follower's last acknowledged one
-// (pr.Match, which the leader rewinds Next to when it handles the rejection) — a lagging but
-// not down follower already holds some entries, so the real backlog it must replicate is
-// targetIndex minus this, not targetIndex itself.
+// Start calls while probe/reject cycles continue for the same still-lagging follower), if id
+// already had an episode recorded, or if the arm instant has not been reached yet.
+// targetIndex snapshots the leader's last index at this instant, which is the backlog the
+// replication phase later waits on. followerStartIndex snapshots the index this catch-up
+// resumes from, i.e. the follower's last acknowledged one (pr.Match, which the leader rewinds
+// Next to when it handles the rejection) — a lagging but not down follower already holds some
+// entries, so the real backlog it must replicate is targetIndex minus this, not targetIndex
+// itself.
 func (cm *CatchUpMsr) Start(id uint64, targetIndex uint64, followerStartIndex uint64) {
 	if cm.recorded[id] {
 		return
 	}
-	if _, ok := cm.active[id]; ok {
+
+	now := time.Now().UnixNano()
+	if now < cm.armNs {
 		return
 	}
+
+	if ep, ok := cm.active[id]; ok {
+		if ep.startNs >= cm.armNs {
+			return
+		}
+		delete(cm.active, id)
+	}
+
 	cm.active[id] = &catchUpEpisode{
-		startNs:            time.Now().UnixNano(),
+		startNs:            now,
 		targetIndex:        targetIndex,
 		followerStartIndex: followerStartIndex,
 	}
@@ -120,6 +136,12 @@ func (cm *CatchUpMsr) IsActive(id uint64) bool {
 // therefore done contributing to this run's output.
 func (cm *CatchUpMsr) IsRecorded(id uint64) bool {
 	return cm.recorded[id]
+}
+
+// NOTE (Gus): reports whether the arm instant has been reached, i.e. whether an episode
+// opening now would be measurable at all. Always true when no arm instant was configured.
+func (cm *CatchUpMsr) IsArmed() bool {
+	return time.Now().UnixNano() >= cm.armNs
 }
 
 // NOTE (Gus): reports whether any episode is in flight at all. Lets the leader skip the
@@ -181,9 +203,25 @@ func (cm *CatchUpMsr) EndReplicationDebug(id uint64, endNs int64, info CatchUpDe
 	cm.endReplication(id, endNs, &info)
 }
 
+// NOTE (Gus): discards an episode that opened before the arm instant and reports having done
+// so. Defensive, for the same backwards-clock case Start guards against: an episode timed
+// from before the failure window is not the event being measured, and reaching an end path is
+// no reason to record it. The follower keeps its slot — the episode worth recording is still
+// to come, which is the whole point of arming.
+func (cm *CatchUpMsr) dropIfPreArm(id uint64, ep *catchUpEpisode) bool {
+	if ep.startNs >= cm.armNs {
+		return false
+	}
+	delete(cm.active, id)
+	return true
+}
+
 func (cm *CatchUpMsr) endRecovery(id uint64, endNs int64, info *CatchUpDebugInfo) {
 	ep, ok := cm.active[id]
 	if !ok || ep.recoveryDone {
+		return
+	}
+	if cm.dropIfPreArm(id, ep) {
 		return
 	}
 
@@ -199,6 +237,9 @@ func (cm *CatchUpMsr) endRecovery(id uint64, endNs int64, info *CatchUpDebugInfo
 func (cm *CatchUpMsr) endReplication(id uint64, endNs int64, info *CatchUpDebugInfo) {
 	ep, ok := cm.active[id]
 	if !ok {
+		return
+	}
+	if cm.dropIfPreArm(id, ep) {
 		return
 	}
 
@@ -227,10 +268,6 @@ func (cm *CatchUpMsr) record(phase string, id uint64, ep *catchUpEpisode, endNs 
 	if err != nil {
 		log.Fatalln("failed recording", phase, "duration, err:", err)
 	}
-
-	// NOTE (Gus): a run yields two lines at most, so writing through costs nothing and
-	// keeps the measurement from being lost when the leader is killed without a clean
-	// etcd shutdown.
 	cm.Flush()
 }
 

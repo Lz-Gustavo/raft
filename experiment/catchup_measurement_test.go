@@ -18,13 +18,21 @@ const (
 	follower3 = uint64(3)
 )
 
-// newTestMsr returns a measurer writing to a temporary file, along with a reader closing
-// over that file that flushes and splits the recorded lines.
+// newTestMsr returns a measurer armed from the start — the default of any run that does not
+// configure an arm instant — along with a reader closing over its file.
 func newTestMsr(t *testing.T) (*experiment.CatchUpMsr, func() []string) {
+	t.Helper()
+	return newArmedTestMsr(t, 0)
+}
+
+// newArmedTestMsr returns a measurer that ignores every episode opening before armNs, writing
+// to a temporary file, along with a reader closing over that file that flushes and splits the
+// recorded lines.
+func newArmedTestMsr(t *testing.T, armNs int64) (*experiment.CatchUpMsr, func() []string) {
 	t.Helper()
 
 	fn := filepath.Join(t.TempDir(), "test-measurement.out")
-	cm, err := experiment.NewCatchUpMsr(fn)
+	cm, err := experiment.NewCatchUpMsr(fn, armNs)
 	require.NoError(t, err, "NewCatchUpMsr() failed")
 	t.Cleanup(cm.Close)
 
@@ -319,9 +327,80 @@ func TestCatchUpMsr_Episodes(t *testing.T) {
 	}
 }
 
+func TestCatchUpMsr_Arming(t *testing.T) {
+	t.Run("an arm instant in the future records nothing", func(t *testing.T) {
+		cm, recorded := newArmedTestMsr(t, time.Now().Add(time.Hour).UnixNano())
+		assert.False(t, cm.IsArmed())
+
+		cm.Start(follower3, 100, 40)
+		assert.False(t, cm.IsActive(follower3), "no episode may open before the arm instant")
+		assert.False(t, cm.HasActive())
+
+		cm.EndRecovery(follower3, nowNs())
+		cm.EndReplication(follower3, nowNs())
+
+		assert.Empty(t, recorded(), "a run whose arm instant is never reached records nothing")
+		assert.False(t, cm.IsRecorded(follower3), "the follower keeps its slot")
+	})
+
+	t.Run("an arm instant in the past measures every episode", func(t *testing.T) {
+		cm, recorded := newArmedTestMsr(t, time.Now().Add(-time.Hour).UnixNano())
+		assert.True(t, cm.IsArmed())
+
+		cm.Start(follower2, 100, 40)
+		require.True(t, cm.IsActive(follower2))
+		cm.EndRecovery(follower2, nowNs())
+		cm.EndReplication(follower2, nowNs())
+
+		lines := recorded()
+		require.Len(t, lines, 2)
+		assert.Equal(t, []uint64{follower2, follower2}, idsOf(t, lines),
+			"an already-reached arm instant must behave exactly as an unset one")
+	})
+
+	// Regression test for the 5-catchup-v4/100ms data: in 34 of 42 runs the follower that
+	// later recovers from the injected failure had already opened and completed an episode
+	// of its own at t = 0.3-12 s, provoked by load onset. Keyed by follower and unarmed,
+	// that artifact consumed the follower's single slot and the post-kill episode — the one
+	// the experiment exists to measure — could never open.
+	t.Run("a pre-arm episode does not consume the follower's slot", func(t *testing.T) {
+		armNs := time.Now().Add(20 * time.Millisecond).UnixNano()
+		cm, recorded := newArmedTestMsr(t, armNs)
+
+		// Load onset, before the failure window: opens and completes, records nothing.
+		cm.Start(follower3, 100, 40)
+		cm.EndRecovery(follower3, nowNs())
+		cm.EndReplication(follower3, nowNs())
+		require.Empty(t, recorded(), "a pre-arm episode is not the event being measured")
+
+		time.Sleep(30 * time.Millisecond)
+		require.True(t, cm.IsArmed())
+
+		// The injected failure: the same follower becomes quorum-critical once armed.
+		cm.Start(follower3, 5000, 1200)
+		require.True(t, cm.IsActive(follower3), "the real episode must still be able to open")
+
+		target, ok := cm.Target(follower3)
+		assert.True(t, ok)
+		assert.Equal(t, uint64(5000), target, "the real episode carries its own backlog")
+
+		cm.EndRecovery(follower3, nowNs())
+		cm.EndReplication(follower3, nowNs())
+
+		lines := recorded()
+		require.Len(t, lines, 2)
+		for _, line := range lines {
+			_, id, startNs, _ := parseLine(t, line)
+			assert.Equal(t, follower3, id)
+			assert.GreaterOrEqual(t, startNs, armNs, "only a post-arm episode may be recorded")
+		}
+	})
+}
+
 func TestCatchUpMsr_EpisodeState(t *testing.T) {
 	cm, recorded := newTestMsr(t)
 
+	assert.True(t, cm.IsArmed(), "an unset arm instant measures from the start")
 	assert.False(t, cm.IsActive(follower2))
 	assert.False(t, cm.IsRecorded(follower2))
 	assert.False(t, cm.HasActive())
