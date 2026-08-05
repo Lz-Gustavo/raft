@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"slices"
 	"time"
 )
 
@@ -12,17 +13,18 @@ const (
 	catchupMeasurementFmt      = "%s:%d:%d:%d\n"
 	catchupMeasurementDebugFmt = "%s:%d:%d:%d %s\n"
 
-	// NOTE (Gus): phase tags leading every recorded line. A single catch-up episode
-	// yields one line per phase, both timed from the same start instant, so the
-	// replication duration always contains the recovery one.
 	catchupPhaseRecovery    = "recovery"
 	catchupPhaseReplication = "replication"
+	catchupPhaseAbandoned   = "abandoned"
+	maxEpisodesPerFollower  = 512
 )
 
 type CatchUpDebugInfo struct {
 	FollowerID       uint64
 	LogEntries       uint64
+	AckedEntries     uint64
 	TargetIndex      uint64
+	CommitStallNs    int64
 	LeaderFirstIndex uint64
 	LeaderLastIndex  uint64
 	LeaderCommitted  uint64
@@ -36,38 +38,41 @@ type catchUpEpisode struct {
 	startNs            int64
 	targetIndex        uint64
 	followerStartIndex uint64
-	recoveryDone       bool
+
+	// how long the leader's commit index had been frozen when this episode opened
+	commitStallNs int64
+
+	lastMatch    uint64
+	recoveryDone bool
 }
 
-// NOTE (Gus): the measurement records the *first* complete episode of each follower that
-// began at or after the arm instant, and nothing more for that follower. It makes no attempt
-// to decide on its own which episode was caused by the injected failure: the leader cannot
-// know that, and the liveness heuristic that used to try (a peer-silence threshold gating a
-// single global shot) got it wrong. Load onset provokes a probe/reject cycle on a healthy
-// follower seconds before any failure is injected, and under a global latch that early
-// artifact consumed the one recording slot and hid the real episode entirely.
-//
-// Keying by follower removes the race between followers: an artifact on one follower is
-// recorded under that follower's ID and leaves every other follower's slot intact. It does
-// not remove the race within a single follower — a load-onset episode on the node that later
-// recovers still burns that node's only slot seconds before the failure. armNs closes that:
-// the experiment harness knows when it will kill the fast follower and hands the leader that
-// instant, so every episode opening before it can be ignored as noise. Zero means armed from
-// the start, which is the behaviour of every run that does not configure it.
+// NOTE (Gus): the measurement records every episode of every follower that begins inside the
+// recording window, and leaves the choice of which one the injected failure caused to a later
+// analysis. Zero armNs means armed from the start and zero windowNs means no upper bound,
+// which together are the behaviour of any run not configuring either. A run that injects no
+// failure at all still measures every episode it sees.
 type CatchUpMsr struct {
 	active   map[uint64]*catchUpEpisode
-	recorded map[uint64]bool
+	recorded map[uint64]int
 	armNs    int64
+	windowNs int64
+	sealed   bool
 
 	buff *bytes.Buffer
 	file *os.File
 }
 
-func NewCatchUpMsr(fn string, armNs int64) (*CatchUpMsr, error) {
+func NewCatchUpMsr(fn string, armNs, windowNs int64) (*CatchUpMsr, error) {
+	// a window with no arm instant would otherwise be anchored at the Unix epoch
+	if armNs <= 0 && windowNs > 0 {
+		armNs = time.Now().UnixNano()
+	}
+
 	cm := &CatchUpMsr{
 		active:   make(map[uint64]*catchUpEpisode),
-		recorded: make(map[uint64]bool),
+		recorded: make(map[uint64]int),
 		armNs:    armNs,
+		windowNs: windowNs,
 		buff:     &bytes.Buffer{},
 	}
 
@@ -80,45 +85,119 @@ func NewCatchUpMsr(fn string, armNs int64) (*CatchUpMsr, error) {
 	return cm, nil
 }
 
-// NOTE (Gus): per-follower start; no-op if already active for id (guards against repeated
-// Start calls while probe/reject cycles continue for the same still-lagging follower), if id
-// already had an episode recorded, or if the arm instant has not been reached yet.
-// targetIndex snapshots the leader's last index at this instant, which is the backlog the
-// replication phase later waits on. followerStartIndex snapshots the index this catch-up
-// resumes from, i.e. the follower's last acknowledged one (pr.Match, which the leader rewinds
-// Next to when it handles the rejection) — a lagging but not down follower already holds some
-// entries, so the real backlog it must replicate is targetIndex minus this, not targetIndex
-// itself.
+// inWindow reports whether an instant falls inside the recording window. Applied to an episode's
+// start, never to its end: a catch-up that opens just before the window closes and runs for
+// another half minute is exactly the event worth having, so the window bounds when episodes
+// may *open* and nothing else.
+func (cm *CatchUpMsr) inWindow(ns int64) bool {
+	return ns >= cm.armNs && (cm.windowNs == 0 || ns < cm.armNs+cm.windowNs)
+}
+
+// sealDeadlineNs sets a tolerance windown for in flight measurements. It sits a full window past
+// the window's end rather than at it, because an episode opening at the very last instant of the
+// window is entitled to the same time to complete as one opening at its start.
+func (cm *CatchUpMsr) sealDeadlineNs() int64 {
+	return cm.armNs + 2*cm.windowNs
+}
+
+func (cm *CatchUpMsr) sealWindow() {
+	if cm.sealed || cm.windowNs == 0 || time.Now().UnixNano() < cm.sealDeadlineNs() {
+		return
+	}
+	cm.sealed = true
+
+	ids := make([]uint64, 0, len(cm.active))
+	for id := range cm.active {
+		ids = append(ids, id)
+	}
+	slices.Sort(ids)
+
+	for _, id := range ids {
+		ep := cm.active[id]
+		delete(cm.active, id)
+		if !cm.inWindow(ep.startNs) {
+			continue
+		}
+
+		// The window's end, not the deadline: the extra window is grace granted to the
+		// episode, not time it should be charged for.
+		info := cm.abandonedInfo(id, ep)
+		cm.record(catchupPhaseAbandoned, id, ep, cm.armNs+cm.windowNs, &info)
+		cm.recorded[id]++
+	}
+}
+
+func (cm *CatchUpMsr) abandonedInfo(id uint64, ep *catchUpEpisode) CatchUpDebugInfo {
+	var logEntries, acked uint64
+	if ep.targetIndex >= ep.followerStartIndex {
+		logEntries = ep.targetIndex - ep.followerStartIndex
+	}
+	if ep.lastMatch >= ep.followerStartIndex {
+		acked = ep.lastMatch - ep.followerStartIndex
+	}
+
+	return CatchUpDebugInfo{
+		FollowerID:    id,
+		LogEntries:    logEntries,
+		AckedEntries:  acked,
+		TargetIndex:   ep.targetIndex,
+		FollowerMatch: ep.lastMatch,
+	}
+}
+
 func (cm *CatchUpMsr) Start(id uint64, targetIndex uint64, followerStartIndex uint64) {
-	if cm.recorded[id] {
+	cm.start(id, targetIndex, followerStartIndex, nil)
+}
+
+func (cm *CatchUpMsr) StartDebug(id uint64, targetIndex uint64, followerStartIndex uint64, info CatchUpDebugInfo) {
+	cm.start(id, targetIndex, followerStartIndex, &info)
+}
+
+func (cm *CatchUpMsr) start(id uint64, targetIndex uint64, followerStartIndex uint64, info *CatchUpDebugInfo) {
+	cm.sealWindow()
+
+	if cm.recorded[id] >= maxEpisodesPerFollower {
 		return
 	}
 
 	now := time.Now().UnixNano()
-	if now < cm.armNs {
+	if !cm.inWindow(now) {
 		return
 	}
 
 	if ep, ok := cm.active[id]; ok {
-		if ep.startNs >= cm.armNs {
+		// an episode opened outside the window is noise that would otherwise hold id's slot
+		// for the whole run, so it is replaced rather than kept. One opened inside it is a
+		// catch-up in progress and is left alone.
+		if cm.inWindow(ep.startNs) {
 			return
 		}
 		delete(cm.active, id)
 	}
 
-	cm.active[id] = &catchUpEpisode{
+	ep := &catchUpEpisode{
 		startNs:            now,
 		targetIndex:        targetIndex,
 		followerStartIndex: followerStartIndex,
+		lastMatch:          followerStartIndex,
 	}
+	if info != nil {
+		ep.commitStallNs = info.CommitStallNs
+	}
+	cm.active[id] = ep
 }
 
-// NOTE (Gus): discards an in-flight measurement for id without recording output — used
-// when id stops being quorum-critical for a reason other than id itself catching up (e.g.
-// a different follower's ack restored quorum). Once the recovery phase was recorded the
-// episode is left alone: its remaining phase tracks pure replication progress, which no
-// longer depends on id being quorum-critical.
+func (cm *CatchUpMsr) Observe(id uint64, match uint64) {
+	ep, ok := cm.active[id]
+	if !ok || match <= ep.lastMatch {
+		return
+	}
+	ep.lastMatch = match
+}
+
 func (cm *CatchUpMsr) Cancel(id uint64) {
+	cm.sealWindow()
+
 	ep, ok := cm.active[id]
 	if !ok || ep.recoveryDone {
 		return
@@ -126,31 +205,33 @@ func (cm *CatchUpMsr) Cancel(id uint64) {
 	delete(cm.active, id)
 }
 
-// NOTE (Gus): reports whether a measurement is in flight for follower id.
+// IsActive reports whether a measurement is in flight for follower id.
 func (cm *CatchUpMsr) IsActive(id uint64) bool {
 	_, ok := cm.active[id]
 	return ok
 }
 
-// NOTE (Gus): reports whether follower id already had an episode recorded, and is
-// therefore done contributing to this run's output.
-func (cm *CatchUpMsr) IsRecorded(id uint64) bool {
+// EpisodeCount returns how many episodes follower id has already contributed to this run's output. An
+// episode counts once it is closed out, whether by its replication phase or by being abandoned
+// at the seal deadline.
+func (cm *CatchUpMsr) EpisodeCount(id uint64) int {
 	return cm.recorded[id]
 }
 
-// NOTE (Gus): reports whether the arm instant has been reached, i.e. whether an episode
-// opening now would be measurable at all. Always true when no arm instant was configured.
+// IsArmed reports whether the recording window is open right now, i.e. whether an episode
+// opening at this instant would be measurable at all. Always true when neither an arm instant
+// nor a window was configured.
 func (cm *CatchUpMsr) IsArmed() bool {
-	return time.Now().UnixNano() >= cm.armNs
+	return cm.inWindow(time.Now().UnixNano())
 }
 
-// NOTE (Gus): reports whether any episode is in flight at all. Lets the leader skip the
+// HasActive reports whether any episode is in flight at all. Lets the leader skip the
 // allocation ActiveFollowers() makes, on a path it walks for every response it steps.
 func (cm *CatchUpMsr) HasActive() bool {
 	return len(cm.active) > 0
 }
 
-// NOTE (Gus): snapshot of follower IDs currently being tracked, used to reassess
+// ActiveFollowers returnsa a snapshot of follower IDs currently being tracked, used to reassess
 // criticality after every progress update.
 func (cm *CatchUpMsr) ActiveFollowers() []uint64 {
 	ids := make([]uint64, 0, len(cm.active))
@@ -160,7 +241,7 @@ func (cm *CatchUpMsr) ActiveFollowers() []uint64 {
 	return ids
 }
 
-// NOTE (Gus): the leader last index snapshotted when id's episode started, and whether an
+// Target returns the leader last index snapshotted when id's episode started, and whether an
 // episode is in flight at all.
 func (cm *CatchUpMsr) Target(id uint64) (uint64, bool) {
 	ep, ok := cm.active[id]
@@ -170,7 +251,7 @@ func (cm *CatchUpMsr) Target(id uint64) (uint64, bool) {
 	return ep.targetIndex, true
 }
 
-// NOTE (Gus): the follower's own last index snapshotted when id's episode started, and
+// FollowerStartIndex determines the follower's own last index snapshotted when id's episode started, and
 // whether an episode is in flight at all. See the Start doc comment for why this matters.
 func (cm *CatchUpMsr) FollowerStartIndex(id uint64) (uint64, bool) {
 	ep, ok := cm.active[id]
@@ -180,7 +261,7 @@ func (cm *CatchUpMsr) FollowerStartIndex(id uint64) (uint64, bool) {
 	return ep.followerStartIndex, true
 }
 
-// NOTE (Gus): closes the recovery phase — the follower is quorum-critical no more and
+// EndRecovery closes the recovery phase — the follower is quorum-critical no more and
 // pending client requests can be replied to again. The episode itself stays in flight to
 // keep timing the replication of its backlog. endNs is the instant the phase ended, taken
 // by the caller rather than here: recording a line fsyncs it, so a clock read at this depth
@@ -193,8 +274,6 @@ func (cm *CatchUpMsr) EndRecoveryDebug(id uint64, endNs int64, info CatchUpDebug
 	cm.endRecovery(id, endNs, &info)
 }
 
-// NOTE (Gus): closes the replication phase and the episode with it, retiring this follower
-// from any further measurement. See EndRecovery on endNs.
 func (cm *CatchUpMsr) EndReplication(id uint64, endNs int64) {
 	cm.endReplication(id, endNs, nil)
 }
@@ -203,13 +282,13 @@ func (cm *CatchUpMsr) EndReplicationDebug(id uint64, endNs int64, info CatchUpDe
 	cm.endReplication(id, endNs, &info)
 }
 
-// NOTE (Gus): discards an episode that opened before the arm instant and reports having done
-// so. Defensive, for the same backwards-clock case Start guards against: an episode timed
-// from before the failure window is not the event being measured, and reaching an end path is
-// no reason to record it. The follower keeps its slot — the episode worth recording is still
-// to come, which is the whole point of arming.
-func (cm *CatchUpMsr) dropIfPreArm(id uint64, ep *catchUpEpisode) bool {
-	if ep.startNs >= cm.armNs {
+// dropIfOutsideWindow discards an episode that opened outside the recording window and reports having
+// done so. Defensive, for the backwards-clock case start guards against: an episode timed from
+// outside the window is not an event this run is measuring, and reaching an end path is no
+// reason to record it. The follower keeps its slot — the episode worth recording is still to
+// come, which is the whole point of the window.
+func (cm *CatchUpMsr) dropIfOutsideWindow(id uint64, ep *catchUpEpisode) bool {
+	if cm.inWindow(ep.startNs) {
 		return false
 	}
 	delete(cm.active, id)
@@ -217,29 +296,28 @@ func (cm *CatchUpMsr) dropIfPreArm(id uint64, ep *catchUpEpisode) bool {
 }
 
 func (cm *CatchUpMsr) endRecovery(id uint64, endNs int64, info *CatchUpDebugInfo) {
+	cm.sealWindow()
+
 	ep, ok := cm.active[id]
 	if !ok || ep.recoveryDone {
 		return
 	}
-	if cm.dropIfPreArm(id, ep) {
+	if cm.dropIfOutsideWindow(id, ep) {
 		return
 	}
 
 	cm.record(catchupPhaseRecovery, id, ep, endNs, info)
 	ep.recoveryDone = true
-
-	// NOTE (Gus): id is spent as soon as it emitted anything, even though the episode
-	// lives on to time its replication. A follower whose backlog is never fully replicated
-	// would otherwise be free to open a second episode and record a second recovery line.
-	cm.recorded[id] = true
 }
 
 func (cm *CatchUpMsr) endReplication(id uint64, endNs int64, info *CatchUpDebugInfo) {
+	cm.sealWindow()
+
 	ep, ok := cm.active[id]
 	if !ok {
 		return
 	}
-	if cm.dropIfPreArm(id, ep) {
+	if cm.dropIfOutsideWindow(id, ep) {
 		return
 	}
 
@@ -253,7 +331,7 @@ func (cm *CatchUpMsr) endReplication(id uint64, endNs int64, info *CatchUpDebugI
 
 	cm.record(catchupPhaseReplication, id, ep, endNs, info)
 	delete(cm.active, id)
-	cm.recorded[id] = true
+	cm.recorded[id]++
 }
 
 func (cm *CatchUpMsr) record(phase string, id uint64, ep *catchUpEpisode, endNs int64, info *CatchUpDebugInfo) {
@@ -263,7 +341,12 @@ func (cm *CatchUpMsr) record(phase string, id uint64, ep *catchUpEpisode, endNs 
 	if info == nil {
 		_, err = fmt.Fprintf(cm.buff, catchupMeasurementFmt, phase, id, ep.startNs, dur)
 	} else {
-		_, err = fmt.Fprintf(cm.buff, catchupMeasurementDebugFmt, phase, id, ep.startNs, dur, formatCatchUpDebugInfo(*info))
+		// The stall belongs to the episode, not to the instant a phase closed, so it is
+		// stamped here rather than trusted from the caller — every line of one episode
+		// reports the same value.
+		stamped := *info
+		stamped.CommitStallNs = ep.commitStallNs
+		_, err = fmt.Fprintf(cm.buff, catchupMeasurementDebugFmt, phase, id, ep.startNs, dur, formatCatchUpDebugInfo(stamped))
 	}
 	if err != nil {
 		log.Fatalln("failed recording", phase, "duration, err:", err)
@@ -272,9 +355,11 @@ func (cm *CatchUpMsr) record(phase string, id uint64, ep *catchUpEpisode, endNs 
 }
 
 func formatCatchUpDebugInfo(info CatchUpDebugInfo) string {
-	return fmt.Sprintf("[logEntries:%d, target:%d, logleader:{firstIndex:%d, lastIndex:%d, committed:%d, applied:%d}, follower:{id:%d, match:%d, next:%d}]",
+	return fmt.Sprintf("[logEntries:%d, acked:%d, target:%d, commitStallNs:%d, logleader:{firstIndex:%d, lastIndex:%d, committed:%d, applied:%d}, follower:{id:%d, match:%d, next:%d}]",
 		info.LogEntries,
+		info.AckedEntries,
 		info.TargetIndex,
+		info.CommitStallNs,
 		info.LeaderFirstIndex,
 		info.LeaderLastIndex,
 		info.LeaderCommitted,

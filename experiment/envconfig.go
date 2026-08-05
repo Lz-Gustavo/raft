@@ -33,6 +33,19 @@ const (
 	// start, i.e. measure every episode, which is what runs not injecting a failure want.
 	MeasureFollowerCatchUpArmAt = "RAFT_MEASURE_FOLLOWER_CATCHUP_ARM_AT"
 
+	// MeasureFollowerCatchUpWindow holds how long, as a Go duration string, the recorder
+	// keeps accepting episodes once armed. Arming alone was not enough: it decides when to
+	// *start* looking, but a single recording slot per follower still went to whichever
+	// reject blip arrived first, and under load the first one arrives within milliseconds
+	// of the arm instant — far sooner than the margin the harness leaves before the kill.
+	// A window drops the single slot instead of trying to aim it: every episode opening in
+	// [armAt, armAt+window) is recorded, and picking the one caused by the failure is left
+	// to offline analysis, which knows the kill instant exactly and the leader never can.
+	// The bound is on when an episode *opens*, never on when it finishes, so a catch-up
+	// running well past the window is still measured end to end. Unset means no upper
+	// bound, i.e. record every episode from the arm instant to the end of the run.
+	MeasureFollowerCatchUpWindow = "RAFT_MEASURE_FOLLOWER_CATCHUP_WINDOW"
+
 	// MeasureFollowerCatchUpDebugEnabled enables extra fields in catch-up
 	// measurements to help inspect log replication during recovery.
 	MeasureFollowerCatchUpDebugEnabled = "RAFT_MEASURE_FOLLOWER_CATCHUP_DEBUG_ENABLED"
@@ -125,7 +138,7 @@ func LoadEnvConfig() {
 			fn = defaultFollowerCatchUpFilename
 		}
 
-		Config.CatchUpMsr, err = NewCatchUpMsr(fn, catchUpArmNs())
+		Config.CatchUpMsr, err = NewCatchUpMsr(fn, catchUpArmNs(), catchUpWindowNs())
 		if err != nil {
 			log.Fatalln(err)
 		}
@@ -178,6 +191,24 @@ func catchUpArmNs() int64 {
 		return 0
 	}
 	return sec * int64(time.Second)
+}
+
+// NOTE (Gus): the configured recording window, in ns. Same never-abort contract as
+// catchUpArmNs: absent, unparsable, zero or negative all mean 0, i.e. no upper bound —
+// the behaviour of a run that arms but never stops recording. The upper bound keeps
+// armNs+2*windowNs (the seal deadline, see catchup_measurement.go) from overflowing, and
+// no experiment has any use for a window measured in days.
+func catchUpWindowNs() int64 {
+	raw, exists := os.LookupEnv(MeasureFollowerCatchUpWindow)
+	if !exists {
+		return 0
+	}
+
+	dur, err := time.ParseDuration(raw)
+	if err != nil || dur <= 0 || dur > 24*time.Hour {
+		return 0
+	}
+	return int64(dur)
 }
 
 func parseEnvBool(env string) bool {

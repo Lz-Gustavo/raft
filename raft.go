@@ -436,6 +436,14 @@ type raft struct {
 	pendingReadIndexMessages []*pb.Message
 
 	traceLogger TraceLogger
+
+	// NOTE (Gus): the instant maybeCommit last moved the commit index forward, kept only
+	// while the follower catch-up measurement is enabled and read only by it. How long
+	// commit has been frozen when a catch-up episode opens is what tells a real
+	// post-failure catch-up from a routine reject blip: with every voter alive the commit
+	// index advances continuously and the stall is ~0, whereas an episode opening after a
+	// voter died finds commit unable to move until the follower being measured acks.
+	commitAdvancedNs int64
 }
 
 func newRaft(c *Config) *raft {
@@ -785,7 +793,25 @@ func (r *raft) appliedSnap(snap *pb.Snapshot) {
 func (r *raft) maybeCommit() bool {
 	defer traceCommit(r)
 
-	return r.raftLog.maybeCommit(entryID{term: r.Term, index: r.trk.Committed()})
+	advanced := r.raftLog.maybeCommit(entryID{term: r.Term, index: r.trk.Committed()})
+
+	// NOTE (Gus): the single choke point every commit advance passes through, so the
+	// measurement's notion of "commit is stalled" is stamped here rather than at any one
+	// of maybeCommit's callers.
+	if advanced && experiment.Config.IsMeasureFollowerCatchUpEnabled {
+		r.commitAdvancedNs = time.Now().UnixNano()
+	}
+	return advanced
+}
+
+// NOTE (Gus): how long the commit index has been frozen, as of now. Zero until the leader
+// commits for the first time, so a stall is never reported against an instant that never
+// happened.
+func (r *raft) commitStallNs(now int64) int64 {
+	if r.commitAdvancedNs == 0 || now <= r.commitAdvancedNs {
+		return 0
+	}
+	return now - r.commitAdvancedNs
 }
 
 // NOTE (Gus): reports whether the leader's log cannot fully commit up to its
@@ -957,6 +983,13 @@ func (r *raft) becomeLeader() {
 	r.tick = r.tickHeartbeat
 	r.lead = r.id
 	r.state = StateLeader
+
+	// NOTE (Gus): a term this node did not lead left commitAdvancedNs frozen at whenever it
+	// last committed as leader, which as a stall would be nonsense. Restart the clock here,
+	// so the first episode of this term measures against this term.
+	if experiment.Config.IsMeasureFollowerCatchUpEnabled {
+		r.commitAdvancedNs = time.Now().UnixNano()
+	}
 	// Followers enter replicate mode when they've been successfully probed
 	// (perhaps after having received a snapshot as a result). The leader is
 	// trivially in this state. Note that r.reset() has initialized this
@@ -1542,21 +1575,11 @@ func stepLeader(r *raft, m *pb.Message) error {
 					pr.BecomeProbe()
 				}
 
-				// NOTE (Gus): the catch-up clock opens here, and only here: MaybeDecrTo
-				// just discarded every stale rejection (a reject and a success crossing in
-				// flight), which would otherwise anchor an episode on a follower that is
-				// already being appended to and end it microseconds later on the next
-				// in-flight ack. Narrowed further to rejections that presently block commit
-				// progress, skipping routine reject/replicate blips. The leader's tip is
-				// snapshotted right before the append below goes out, as the backlog the
-				// replication phase later waits on, and pr.Match alongside it: MaybeDecrTo
-				// rewound Next to Match+1, so targetIndex minus Match — not minus the
-				// follower's own last index, which sits further ahead — is what this
-				// catch-up actually has to put on the wire.
-				if cm := experiment.Config.CatchUpMsr; experiment.Config.IsMeasureFollowerCatchUpEnabled &&
-					cm != nil && r.followerAckRequiredForQuorum(m.GetFrom()) {
-					cm.Start(m.GetFrom(), r.raftLog.lastIndex(), pr.Match)
-				}
+				// NOTE (Gus): the catch-up clock opens here, and only here — see
+				// maybeStartCatchUp for why this rejection branch is the only sound place
+				// for it, and why the episode is anchored to the tip snapshotted just
+				// before the append below goes out.
+				r.maybeStartCatchUp(m, pr)
 
 				// NOTE (Gus): sends index - 1 until if the msg is not rejected
 				// i.e. falls into the else condition bellow
@@ -2260,6 +2283,35 @@ func sendMsgReadIndexResponse(r *raft, m *pb.Message) {
 	}
 }
 
+// NOTE (Gus): opens a catch-up episode for the follower that sent m, if it is presently on
+// the quorum-critical path. Called from the rejection branch of stepLeader and only there:
+// MaybeDecrTo has just discarded every stale rejection (a reject and a success crossing in
+// flight), which would otherwise anchor an episode on a follower that is already being
+// appended to and end it microseconds later on the next in-flight ack.
+//
+// The leader's tip is snapshotted right before the append goes out, as the backlog the
+// replication phase later waits on, and pr.Match alongside it: MaybeDecrTo rewound Next to
+// Match+1, so targetIndex minus Match — not minus the follower's own last index, which sits
+// further ahead — is what this catch-up actually has to put on the wire.
+func (r *raft) maybeStartCatchUp(m *pb.Message, pr *tracker.Progress) {
+	cm := experiment.Config.CatchUpMsr
+	if !experiment.Config.IsMeasureFollowerCatchUpEnabled || cm == nil {
+		return
+	}
+	if !r.followerAckRequiredForQuorum(m.GetFrom()) {
+		return
+	}
+
+	target, followerStart := r.raftLog.lastIndex(), pr.Match
+	if experiment.Config.IsMeasureFollowerCatchUpDebugEnabled {
+		info := r.catchUpDebugInfo(m.GetFrom(), target, followerStart, pr)
+		info.CommitStallNs = r.commitStallNs(time.Now().UnixNano())
+		cm.StartDebug(m.GetFrom(), target, followerStart, info)
+		return
+	}
+	cm.Start(m.GetFrom(), target, followerStart)
+}
+
 // NOTE (Gus): ends the recovery phase of the quorum-critical catch-up measurement for the
 // follower that sent m, if one is in flight. Called only from the branch where
 // maybeCommit() just returned true, so this is the earliest point at which a
@@ -2300,7 +2352,14 @@ func (r *raft) maybeEndCatchUpReplication(m *pb.Message, pr *tracker.Progress, e
 		return
 	}
 	target, ok := cm.Target(m.GetFrom())
-	if !ok || pr.Match < target {
+	if !ok {
+		return
+	}
+	if pr.Match < target {
+		// NOTE (Gus): still short of the backlog. Hand the recorder the progress anyway —
+		// if this episode is later abandoned it has no end line to read the follower's
+		// state off of, and how far it did get is the whole point of that outcome.
+		cm.Observe(m.GetFrom(), pr.Match)
 		return
 	}
 
@@ -2317,15 +2376,28 @@ func (r *raft) maybeEndCatchUpReplication(m *pb.Message, pr *tracker.Progress, e
 // had to replicate to close this episode — target minus the follower's own last index at
 // detection time — not the leader's current log volume: a lagging-but-not-down follower
 // already held some entries, it wasn't starting from zero.
+//
+// AckedEntries is how far the follower actually got, and exists because LogEntries alone
+// turned out to overstate the work. A rejection only rewinds the leader's own bookkeeping
+// (pr.Match), and a follower that already holds the entries answers a probe landing below
+// its commit index with that commit index, so pr.Match can leap the whole backlog in one
+// round trip without a single entry moving. The v5 experiment data is full of such episodes:
+// 14169 "entries" closed in 183ms over a delayed link, which is far more than the single
+// 1MiB MsgApp a probing leader sends could carry. AckedEntries diverging from LogEntries is
+// the signature of that re-sync; the two agreeing is a catch-up that really shipped a log.
 func (r *raft) catchUpDebugInfo(id uint64, target uint64, followerStart uint64, pr *tracker.Progress) experiment.CatchUpDebugInfo {
-	var logEntries uint64
+	var logEntries, acked uint64
 	if target >= followerStart {
 		logEntries = target - followerStart
+	}
+	if pr.Match >= followerStart {
+		acked = pr.Match - followerStart
 	}
 
 	return experiment.CatchUpDebugInfo{
 		FollowerID:       id,
 		LogEntries:       logEntries,
+		AckedEntries:     acked,
 		TargetIndex:      target,
 		LeaderFirstIndex: r.raftLog.firstIndex(),
 		LeaderLastIndex:  r.raftLog.lastIndex(),
