@@ -437,13 +437,6 @@ type raft struct {
 
 	traceLogger TraceLogger
 
-	// NOTE (Gus): the instant maybeCommit last moved the commit index forward, kept only
-	// while the follower catch-up measurement is enabled and read only by it. How long
-	// commit has been frozen when a catch-up episode opens is what tells a real
-	// post-failure catch-up from a routine reject blip: with every voter alive the commit
-	// index advances continuously and the stall is ~0, whereas an episode opening after a
-	// voter died finds commit unable to move until the follower being measured acks.
-	commitAdvancedNs int64
 }
 
 func newRaft(c *Config) *raft {
@@ -793,25 +786,7 @@ func (r *raft) appliedSnap(snap *pb.Snapshot) {
 func (r *raft) maybeCommit() bool {
 	defer traceCommit(r)
 
-	advanced := r.raftLog.maybeCommit(entryID{term: r.Term, index: r.trk.Committed()})
-
-	// NOTE (Gus): the single choke point every commit advance passes through, so the
-	// measurement's notion of "commit is stalled" is stamped here rather than at any one
-	// of maybeCommit's callers.
-	if advanced && experiment.Config.IsMeasureFollowerCatchUpEnabled {
-		r.commitAdvancedNs = time.Now().UnixNano()
-	}
-	return advanced
-}
-
-// NOTE (Gus): how long the commit index has been frozen, as of now. Zero until the leader
-// commits for the first time, so a stall is never reported against an instant that never
-// happened.
-func (r *raft) commitStallNs(now int64) int64 {
-	if r.commitAdvancedNs == 0 || now <= r.commitAdvancedNs {
-		return 0
-	}
-	return now - r.commitAdvancedNs
+	return r.raftLog.maybeCommit(entryID{term: r.Term, index: r.trk.Committed()})
 }
 
 // NOTE (Gus): reports whether the leader's log cannot fully commit up to its
@@ -984,12 +959,6 @@ func (r *raft) becomeLeader() {
 	r.lead = r.id
 	r.state = StateLeader
 
-	// NOTE (Gus): a term this node did not lead left commitAdvancedNs frozen at whenever it
-	// last committed as leader, which as a stall would be nonsense. Restart the clock here,
-	// so the first episode of this term measures against this term.
-	if experiment.Config.IsMeasureFollowerCatchUpEnabled {
-		r.commitAdvancedNs = time.Now().UnixNano()
-	}
 	// Followers enter replicate mode when they've been successfully probed
 	// (perhaps after having received a snapshot as a result). The leader is
 	// trivially in this state. Note that r.reset() has initialized this
@@ -2302,8 +2271,7 @@ func (r *raft) maybeStartCatchUp(m *pb.Message, pr *tracker.Progress) {
 		return
 	}
 
-	target, followerStart := r.raftLog.lastIndex(), pr.Match
-	cm.Start(m.GetFrom(), target, followerStart, r.commitStallNs(time.Now().UnixNano()))
+	cm.Start(m.GetFrom(), r.raftLog.lastIndex(), pr.Match)
 }
 
 // NOTE (Gus): ends the recovery phase of every quorum-critical catch-up episode in flight for
@@ -2364,7 +2332,7 @@ func (r *raft) maybeEndCatchUpReplication(m *pb.Message, pr *tracker.Progress, e
 // NOTE (Gus): the leader and follower log state at the instant a phase closed. Nothing in it
 // depends on which episode is being closed, which is the point — one acknowledgement can close
 // several, and this function has no way to know how many. The per-episode fields of a recorded
-// line (logEntries, acked, target, commitStallNs) are derived by the recorder, from the episode.
+// line (logEntries, acked, target) are derived by the recorder, from the episode.
 func (r *raft) catchUpSnapshot(id uint64, pr *tracker.Progress) experiment.CatchUpSnapshot {
 	return experiment.CatchUpSnapshot{
 		FollowerID:       id,
