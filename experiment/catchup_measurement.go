@@ -16,7 +16,10 @@ const (
 	catchupPhaseRecovery    = "recovery"
 	catchupPhaseReplication = "replication"
 	catchupPhaseAbandoned   = "abandoned"
-	maxEpisodesPerFollower  = 512
+	catchupPhaseEvicted     = "evicted"
+
+	maxEpisodesPerFollower     = 8192
+	maxOpenEpisodesPerFollower = 128
 )
 
 type CatchUpDebugInfo struct {
@@ -25,6 +28,22 @@ type CatchUpDebugInfo struct {
 	AckedEntries     uint64
 	TargetIndex      uint64
 	CommitStallNs    int64
+	LeaderFirstIndex uint64
+	LeaderLastIndex  uint64
+	LeaderCommitted  uint64
+	LeaderApplied    uint64
+	FollowerMatch    uint64
+	FollowerNext     uint64
+}
+
+// NOTE (Gus): the leader-side state at the instant a phase closed. Everything in it is
+// independent of *which* episode is being closed, which is the whole point: one acknowledgement
+// can close several episodes at once, and it would be wrong for the caller to build a payload
+// per episode when it does not know how many there are. The per-episode fields of
+// CatchUpDebugInfo — LogEntries, AckedEntries, TargetIndex, CommitStallNs — are derived here,
+// from the episode, when each line is written.
+type CatchUpSnapshot struct {
+	FollowerID       uint64
 	LeaderFirstIndex uint64
 	LeaderLastIndex  uint64
 	LeaderCommitted  uint64
@@ -42,7 +61,6 @@ type catchUpEpisode struct {
 	// how long the leader's commit index had been frozen when this episode opened
 	commitStallNs int64
 
-	lastMatch    uint64
 	recoveryDone bool
 }
 
@@ -52,28 +70,41 @@ type catchUpEpisode struct {
 // which together are the behaviour of any run not configuring either. A run that injects no
 // failure at all still measures every episode it sees.
 type CatchUpMsr struct {
-	active   map[uint64]*catchUpEpisode
+	active   map[uint64][]*catchUpEpisode
 	recorded map[uint64]int
-	armNs    int64
-	windowNs int64
-	sealed   bool
+	evicted  map[uint64]int
+
+	// the follower's high-water acknowledged index. Shared by every episode of that follower —
+	// they all watch the same pr.Match — and read only when an episode has to be abandoned
+	// without an end line to take the follower's state from.
+	lastMatch       map[uint64]uint64
+	pendingRecovery map[uint64]int
+
+	armNs       int64
+	windowNs    int64
+	sealGraceNs int64
+	sealed      bool
 
 	buff *bytes.Buffer
 	file *os.File
 }
 
-func NewCatchUpMsr(fn string, armNs, windowNs int64) (*CatchUpMsr, error) {
+func NewCatchUpMsr(fn string, armNs, windowNs, sealGraceNs int64) (*CatchUpMsr, error) {
 	// a window with no arm instant would otherwise be anchored at the Unix epoch
 	if armNs <= 0 && windowNs > 0 {
 		armNs = time.Now().UnixNano()
 	}
 
 	cm := &CatchUpMsr{
-		active:   make(map[uint64]*catchUpEpisode),
-		recorded: make(map[uint64]int),
-		armNs:    armNs,
-		windowNs: windowNs,
-		buff:     &bytes.Buffer{},
+		active:          make(map[uint64][]*catchUpEpisode),
+		recorded:        make(map[uint64]int),
+		evicted:         make(map[uint64]int),
+		lastMatch:       make(map[uint64]uint64),
+		pendingRecovery: make(map[uint64]int),
+		armNs:           armNs,
+		windowNs:        windowNs,
+		sealGraceNs:     sealGraceNs,
+		buff:            &bytes.Buffer{},
 	}
 
 	fd, err := createMeasurementFile(fn)
@@ -93,11 +124,15 @@ func (cm *CatchUpMsr) inWindow(ns int64) bool {
 	return ns >= cm.armNs && (cm.windowNs == 0 || ns < cm.armNs+cm.windowNs)
 }
 
-// sealDeadlineNs sets a tolerance windown for in flight measurements. It sits a full window past
-// the window's end rather than at it, because an episode opening at the very last instant of the
-// window is entitled to the same time to complete as one opening at its start.
+// sealDeadlineNs sets a tolerance for in-flight measurements: an episode opening at the very last
+// instant of the window is entitled to time to complete, so the deadline sits past the window's
+// end rather than at it.
 func (cm *CatchUpMsr) sealDeadlineNs() int64 {
-	return cm.armNs + 2*cm.windowNs
+	grace := cm.sealGraceNs
+	if grace <= 0 {
+		grace = cm.windowNs
+	}
+	return cm.armNs + cm.windowNs + grace
 }
 
 func (cm *CatchUpMsr) sealWindow() {
@@ -110,50 +145,62 @@ func (cm *CatchUpMsr) sealWindow() {
 	for id := range cm.active {
 		ids = append(ids, id)
 	}
+	for id := range cm.evicted {
+		if _, ok := cm.active[id]; !ok {
+			ids = append(ids, id)
+		}
+	}
 	slices.Sort(ids)
 
+	wrote := false
 	for _, id := range ids {
-		ep := cm.active[id]
-		delete(cm.active, id)
-		if !cm.inWindow(ep.startNs) {
-			continue
-		}
+		for _, ep := range cm.active[id] {
+			if !cm.inWindow(ep.startNs) {
+				continue
+			}
 
-		// The window's end, not the deadline: the extra window is grace granted to the
-		// episode, not time it should be charged for.
-		info := cm.abandonedInfo(id, ep)
-		cm.record(catchupPhaseAbandoned, id, ep, cm.armNs+cm.windowNs, &info)
-		cm.recorded[id]++
+			// the window's end, not the deadline: the extra grace is granted to the episode,
+			// not time it should be charged for.
+			info := cm.abandonedInfo(id, ep)
+			cm.recordInfo(catchupPhaseAbandoned, id, ep.startNs, cm.armNs+cm.windowNs-ep.startNs, &info)
+			cm.recorded[id]++
+			wrote = true
+		}
+		delete(cm.active, id)
+		delete(cm.pendingRecovery, id)
+
+		// one summary line rather than one line per eviction
+		if n := cm.evicted[id]; n > 0 {
+			cm.recordRaw(catchupPhaseEvicted, id, cm.armNs, int64(n))
+			wrote = true
+		}
+	}
+
+	if wrote {
+		cm.Flush()
 	}
 }
 
 func (cm *CatchUpMsr) abandonedInfo(id uint64, ep *catchUpEpisode) CatchUpDebugInfo {
-	var logEntries, acked uint64
-	if ep.targetIndex >= ep.followerStartIndex {
-		logEntries = ep.targetIndex - ep.followerStartIndex
-	}
-	if ep.lastMatch >= ep.followerStartIndex {
-		acked = ep.lastMatch - ep.followerStartIndex
+	match := cm.lastMatch[id]
+	if match < ep.followerStartIndex {
+		match = ep.followerStartIndex
 	}
 
 	return CatchUpDebugInfo{
 		FollowerID:    id,
-		LogEntries:    logEntries,
-		AckedEntries:  acked,
+		LogEntries:    sub(ep.targetIndex, ep.followerStartIndex),
+		AckedEntries:  sub(match, ep.followerStartIndex),
 		TargetIndex:   ep.targetIndex,
-		FollowerMatch: ep.lastMatch,
+		CommitStallNs: ep.commitStallNs,
+		FollowerMatch: match,
 	}
 }
 
-func (cm *CatchUpMsr) Start(id uint64, targetIndex uint64, followerStartIndex uint64) {
-	cm.start(id, targetIndex, followerStartIndex, nil)
-}
-
-func (cm *CatchUpMsr) StartDebug(id uint64, targetIndex uint64, followerStartIndex uint64, info CatchUpDebugInfo) {
-	cm.start(id, targetIndex, followerStartIndex, &info)
-}
-
-func (cm *CatchUpMsr) start(id uint64, targetIndex uint64, followerStartIndex uint64, info *CatchUpDebugInfo) {
+// Start opens a catch-up episode for a follower. commitStallNs is how long the leader's commit
+// index had been frozen at this instant; it belongs to the episode, so every line the episode
+// later produces reports the same value.
+func (cm *CatchUpMsr) Start(id uint64, targetIndex, followerStartIndex uint64, commitStallNs int64) {
 	cm.sealWindow()
 
 	if cm.recorded[id] >= maxEpisodesPerFollower {
@@ -165,50 +212,73 @@ func (cm *CatchUpMsr) start(id uint64, targetIndex uint64, followerStartIndex ui
 		return
 	}
 
-	if ep, ok := cm.active[id]; ok {
-		// an episode opened outside the window is noise that would otherwise hold id's slot
-		// for the whole run, so it is replaced rather than kept. One opened inside it is a
-		// catch-up in progress and is left alone.
-		if cm.inWindow(ep.startNs) {
-			return
-		}
-		delete(cm.active, id)
+	open := cm.active[id]
+	if len(open) >= maxOpenEpisodesPerFollower {
+		open = cm.evictOldest(id, open)
 	}
 
-	ep := &catchUpEpisode{
+	cm.active[id] = append(open, &catchUpEpisode{
 		startNs:            now,
 		targetIndex:        targetIndex,
 		followerStartIndex: followerStartIndex,
-		lastMatch:          followerStartIndex,
+		commitStallNs:      commitStallNs,
+	})
+	cm.pendingRecovery[id]++
+
+	if _, ok := cm.lastMatch[id]; !ok {
+		cm.lastMatch[id] = followerStartIndex
 	}
-	if info != nil {
-		ep.commitStallNs = info.CommitStallNs
-	}
-	cm.active[id] = ep
 }
 
-func (cm *CatchUpMsr) Observe(id uint64, match uint64) {
-	ep, ok := cm.active[id]
-	if !ok || match <= ep.lastMatch {
-		return
+// evictOldest makes room by dropping the follower's oldest open episode. The oldest is the right
+// one to lose: the analysis wants the first episode opening at or after the injected failure, so
+// the newest are the candidates worth protecting. Nothing is written here — see the summary line
+// in sealWindow.
+func (cm *CatchUpMsr) evictOldest(id uint64, open []*catchUpEpisode) []*catchUpEpisode {
+	if len(open) == 0 {
+		return open
 	}
-	ep.lastMatch = match
+	cm.evicted[id]++
+	return open[1:]
 }
 
 func (cm *CatchUpMsr) Cancel(id uint64) {
 	cm.sealWindow()
 
-	ep, ok := cm.active[id]
-	if !ok || ep.recoveryDone {
+	open := cm.active[id]
+	if len(open) == 0 {
 		return
 	}
-	delete(cm.active, id)
+
+	// An episode whose recovery was already recorded is tracking pure replication and no longer
+	// cares about quorum, so resolving criticality elsewhere is not a reason to discard it.
+	kept := open[:0]
+	for _, ep := range open {
+		if ep.recoveryDone {
+			kept = append(kept, ep)
+		}
+	}
+	cm.setOpen(id, kept)
 }
 
-// IsActive reports whether a measurement is in flight for follower id.
+// setOpen replaces a follower's open set, dropping the map entry when it empties so HasActive and
+// ActiveFollowers stay honest about which followers are actually being tracked.
+func (cm *CatchUpMsr) setOpen(id uint64, open []*catchUpEpisode) {
+	if len(open) == 0 {
+		delete(cm.active, id)
+		return
+	}
+	cm.active[id] = open
+}
+
+// IsActive reports whether any measurement is in flight for follower id.
 func (cm *CatchUpMsr) IsActive(id uint64) bool {
-	_, ok := cm.active[id]
-	return ok
+	return len(cm.active[id]) > 0
+}
+
+// OpenEpisodeCount returns how many episodes are in flight for follower id.
+func (cm *CatchUpMsr) OpenEpisodeCount(id uint64) int {
+	return len(cm.active[id])
 }
 
 // EpisodeCount returns how many episodes follower id has already contributed to this run's output. An
@@ -216,6 +286,12 @@ func (cm *CatchUpMsr) IsActive(id uint64) bool {
 // at the seal deadline.
 func (cm *CatchUpMsr) EpisodeCount(id uint64) int {
 	return cm.recorded[id]
+}
+
+// EvictedCount returns how many of follower id's episodes were dropped to stay under the open
+// cap, i.e. how much this run is known to be missing.
+func (cm *CatchUpMsr) EvictedCount(id uint64) int {
+	return cm.evicted[id]
 }
 
 // IsArmed reports whether the recording window is open right now, i.e. whether an episode
@@ -231,7 +307,7 @@ func (cm *CatchUpMsr) HasActive() bool {
 	return len(cm.active) > 0
 }
 
-// ActiveFollowers returnsa a snapshot of follower IDs currently being tracked, used to reassess
+// ActiveFollowers returns a snapshot of follower IDs currently being tracked, used to reassess
 // criticality after every progress update.
 func (cm *CatchUpMsr) ActiveFollowers() []uint64 {
 	ids := make([]uint64, 0, len(cm.active))
@@ -241,117 +317,156 @@ func (cm *CatchUpMsr) ActiveFollowers() []uint64 {
 	return ids
 }
 
-// Target returns the leader last index snapshotted when id's episode started, and whether an
-// episode is in flight at all.
-func (cm *CatchUpMsr) Target(id uint64) (uint64, bool) {
-	ep, ok := cm.active[id]
-	if !ok {
-		return 0, false
-	}
-	return ep.targetIndex, true
-}
-
-// FollowerStartIndex determines the follower's own last index snapshotted when id's episode started, and
-// whether an episode is in flight at all. See the Start doc comment for why this matters.
-func (cm *CatchUpMsr) FollowerStartIndex(id uint64) (uint64, bool) {
-	ep, ok := cm.active[id]
-	if !ok {
-		return 0, false
-	}
-	return ep.followerStartIndex, true
-}
-
 // EndRecovery closes the recovery phase — the follower is quorum-critical no more and
-// pending client requests can be replied to again. The episode itself stays in flight to
-// keep timing the replication of its backlog. endNs is the instant the phase ended, taken
-// by the caller rather than here: recording a line fsyncs it, so a clock read at this depth
-// would charge the write of one phase to the duration of the next.
-func (cm *CatchUpMsr) EndRecovery(id uint64, endNs int64) {
-	cm.endRecovery(id, endNs, nil)
+// pending client requests can be replied to again. The episodes themselves stay in flight to
+// keep timing the replication of their backlogs. endNs is the instant the phase ended, taken
+// by the caller rather than here: a clock read at this depth would charge the write of one
+// phase to the duration of the next.
+func (cm *CatchUpMsr) EndRecovery(id uint64, endNs int64, snap CatchUpSnapshot) {
+	cm.endRecovery(id, endNs, snap, false)
 }
 
-func (cm *CatchUpMsr) EndRecoveryDebug(id uint64, endNs int64, info CatchUpDebugInfo) {
-	cm.endRecovery(id, endNs, &info)
+func (cm *CatchUpMsr) EndRecoveryDebug(id uint64, endNs int64, snap CatchUpSnapshot) {
+	cm.endRecovery(id, endNs, snap, true)
 }
 
-func (cm *CatchUpMsr) EndReplication(id uint64, endNs int64) {
-	cm.endReplication(id, endNs, nil)
+func (cm *CatchUpMsr) EndReplication(id uint64, endNs int64, snap CatchUpSnapshot) {
+	cm.endReplication(id, endNs, snap, false)
 }
 
-func (cm *CatchUpMsr) EndReplicationDebug(id uint64, endNs int64, info CatchUpDebugInfo) {
-	cm.endReplication(id, endNs, &info)
+func (cm *CatchUpMsr) EndReplicationDebug(id uint64, endNs int64, snap CatchUpSnapshot) {
+	cm.endReplication(id, endNs, snap, true)
 }
 
-// dropIfOutsideWindow discards an episode that opened outside the recording window and reports having
-// done so. Defensive, for the backwards-clock case start guards against: an episode timed from
-// outside the window is not an event this run is measuring, and reaching an end path is no
-// reason to record it. The follower keeps its slot — the episode worth recording is still to
-// come, which is the whole point of the window.
-func (cm *CatchUpMsr) dropIfOutsideWindow(id uint64, ep *catchUpEpisode) bool {
-	if cm.inWindow(ep.startNs) {
-		return false
-	}
-	delete(cm.active, id)
-	return true
-}
-
-func (cm *CatchUpMsr) endRecovery(id uint64, endNs int64, info *CatchUpDebugInfo) {
+// NOTE (Gus): every open episode of this follower is settled here, not just one. The caller
+// only reaches this path when maybeCommit() returned true, and the sole progress mutation in
+// that branch is this follower's, so the acknowledgement that restored quorum restored it for
+// every episode of that follower that was still waiting on it.
+func (cm *CatchUpMsr) endRecovery(id uint64, endNs int64, snap CatchUpSnapshot, debug bool) {
 	cm.sealWindow()
 
-	ep, ok := cm.active[id]
-	if !ok || ep.recoveryDone {
+	if cm.pendingRecovery[id] == 0 {
 		return
 	}
-	if cm.dropIfOutsideWindow(id, ep) {
-		return
-	}
+	cm.observeMatch(id, snap.FollowerMatch)
 
-	cm.record(catchupPhaseRecovery, id, ep, endNs, info)
-	ep.recoveryDone = true
+	open := cm.active[id]
+	kept := open[:0]
+	wrote := false
+	for _, ep := range open {
+		// Defensive, for the backwards-clock case Start guards against: an episode timed from
+		// outside the window is not an event this run is measuring, and reaching an end path is
+		// no reason to record it.
+		if !cm.inWindow(ep.startNs) {
+			continue
+		}
+		if !ep.recoveryDone {
+			cm.recordEpisode(catchupPhaseRecovery, id, ep, endNs, snap, debug)
+			ep.recoveryDone = true
+			wrote = true
+		}
+		kept = append(kept, ep)
+	}
+	cm.setOpen(id, kept)
+	cm.pendingRecovery[id] = 0
+
+	if wrote {
+		cm.Flush()
+	}
 }
 
-func (cm *CatchUpMsr) endReplication(id uint64, endNs int64, info *CatchUpDebugInfo) {
+// NOTE (Gus): the open set is ordered by startNs, and therefore by targetIndex too — the
+// leader's last index only grows, so an episode opened later can never carry a smaller target.
+// The first episode the follower has not reached ends the scan, because no later one can be
+// satisfied either. That is what keeps this O(1) in the steady state on a path the leader walks
+// for every response it steps, ~25k times a second at the top of the client sweep.
+func (cm *CatchUpMsr) endReplication(id uint64, endNs int64, snap CatchUpSnapshot, debug bool) {
 	cm.sealWindow()
 
-	ep, ok := cm.active[id]
-	if !ok {
+	open := cm.active[id]
+	if len(open) == 0 {
 		return
 	}
-	if cm.dropIfOutsideWindow(id, ep) {
-		return
+	cm.observeMatch(id, snap.FollowerMatch)
+
+	match := cm.lastMatch[id]
+	closed, wrote := 0, false
+	for _, ep := range open {
+		if !cm.inWindow(ep.startNs) {
+			closed++
+			continue
+		}
+		if match < ep.targetIndex {
+			break
+		}
+
+		// The follower can replicate the whole backlog before any commit crossed quorum on its
+		// behalf, so emit the pending recovery line here to keep both phases of an episode
+		// always present in the output.
+		if !ep.recoveryDone {
+			cm.recordEpisode(catchupPhaseRecovery, id, ep, endNs, snap, debug)
+			ep.recoveryDone = true
+		}
+		cm.recordEpisode(catchupPhaseReplication, id, ep, endNs, snap, debug)
+		cm.recorded[id]++
+		closed++
+		wrote = true
 	}
 
-	// NOTE (Gus): the follower can replicate the whole backlog before any commit crossed
-	// quorum on its behalf, so emit the pending recovery line here to keep both phases of
-	// an episode always present in the output.
-	if !ep.recoveryDone {
-		cm.record(catchupPhaseRecovery, id, ep, endNs, info)
-		ep.recoveryDone = true
+	if closed > 0 {
+		cm.setOpen(id, open[closed:])
 	}
-
-	cm.record(catchupPhaseReplication, id, ep, endNs, info)
-	delete(cm.active, id)
-	cm.recorded[id]++
+	if wrote {
+		cm.Flush()
+	}
 }
 
-func (cm *CatchUpMsr) record(phase string, id uint64, ep *catchUpEpisode, endNs int64, info *CatchUpDebugInfo) {
-	dur := endNs - ep.startNs
-
-	var err error
-	if info == nil {
-		_, err = fmt.Fprintf(cm.buff, catchupMeasurementFmt, phase, id, ep.startNs, dur)
-	} else {
-		// The stall belongs to the episode, not to the instant a phase closed, so it is
-		// stamped here rather than trusted from the caller — every line of one episode
-		// reports the same value.
-		stamped := *info
-		stamped.CommitStallNs = ep.commitStallNs
-		_, err = fmt.Fprintf(cm.buff, catchupMeasurementDebugFmt, phase, id, ep.startNs, dur, formatCatchUpDebugInfo(stamped))
+// observeMatch keeps the follower's high-water acknowledged index. One value per follower rather
+// than per episode: they all watch the same pr.Match, and each episode subtracts its own start
+// index from it. Only an abandoned episode ever reads it, and how far it did get is the whole
+// point of that outcome.
+func (cm *CatchUpMsr) observeMatch(id uint64, match uint64) {
+	if match <= cm.lastMatch[id] {
+		return
 	}
-	if err != nil {
+	cm.lastMatch[id] = match
+}
+
+func (cm *CatchUpMsr) recordEpisode(phase string, id uint64, ep *catchUpEpisode, endNs int64, snap CatchUpSnapshot, debug bool) {
+	if !debug {
+		cm.recordRaw(phase, id, ep.startNs, endNs-ep.startNs)
+		return
+	}
+
+	info := CatchUpDebugInfo{
+		FollowerID:       id,
+		LogEntries:       sub(ep.targetIndex, ep.followerStartIndex),
+		AckedEntries:     sub(snap.FollowerMatch, ep.followerStartIndex),
+		TargetIndex:      ep.targetIndex,
+		CommitStallNs:    ep.commitStallNs,
+		LeaderFirstIndex: snap.LeaderFirstIndex,
+		LeaderLastIndex:  snap.LeaderLastIndex,
+		LeaderCommitted:  snap.LeaderCommitted,
+		LeaderApplied:    snap.LeaderApplied,
+		FollowerMatch:    snap.FollowerMatch,
+		FollowerNext:     snap.FollowerNext,
+	}
+	cm.recordInfo(phase, id, ep.startNs, endNs-ep.startNs, &info)
+}
+
+// recordRaw and recordInfo buffer one line each. Neither flushes: a single acknowledgement can
+// close many episodes, and one fsync per line would put hundreds of them inside one stepLeader
+// call. The caller flushes once before returning, so nothing outlives the hook unpersisted.
+func (cm *CatchUpMsr) recordRaw(phase string, id uint64, startNs, value int64) {
+	if _, err := fmt.Fprintf(cm.buff, catchupMeasurementFmt, phase, id, startNs, value); err != nil {
 		log.Fatalln("failed recording", phase, "duration, err:", err)
 	}
-	cm.Flush()
+}
+
+func (cm *CatchUpMsr) recordInfo(phase string, id uint64, startNs, durNs int64, info *CatchUpDebugInfo) {
+	if _, err := fmt.Fprintf(cm.buff, catchupMeasurementDebugFmt, phase, id, startNs, durNs, formatCatchUpDebugInfo(*info)); err != nil {
+		log.Fatalln("failed recording", phase, "duration, err:", err)
+	}
 }
 
 func formatCatchUpDebugInfo(info CatchUpDebugInfo) string {
@@ -368,6 +483,13 @@ func formatCatchUpDebugInfo(info CatchUpDebugInfo) string {
 		info.FollowerMatch,
 		info.FollowerNext,
 	)
+}
+
+func sub(a, b uint64) uint64 {
+	if a < b {
+		return 0
+	}
+	return a - b
 }
 
 func (cm *CatchUpMsr) Flush() {

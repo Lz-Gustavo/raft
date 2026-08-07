@@ -1,6 +1,7 @@
 package experiment_test
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -26,14 +27,21 @@ func newTestMsr(t *testing.T) (*experiment.CatchUpMsr, func() []string) {
 }
 
 // newArmedTestMsr returns a measurer recording only episodes that open in
-// [armNs, armNs+windowNs), writing to a temporary file, along with a reader closing over that
-// file that flushes and splits the recorded lines. A zero windowNs leaves the window
-// unbounded above.
+// [armNs, armNs+windowNs). The seal grace is left unset, so the deadline falls back to a second
+// window — the 7-catchup-v6 behaviour these window tests were written against.
 func newArmedTestMsr(t *testing.T, armNs, windowNs int64) (*experiment.CatchUpMsr, func() []string) {
+	t.Helper()
+	return newSealTestMsr(t, armNs, windowNs, 0)
+}
+
+// newSealTestMsr returns a measurer writing to a temporary file, along with a reader closing
+// over that file that flushes and splits the recorded lines. A zero windowNs leaves the window
+// unbounded above; a zero sealGraceNs falls back to the window.
+func newSealTestMsr(t *testing.T, armNs, windowNs, sealGraceNs int64) (*experiment.CatchUpMsr, func() []string) {
 	t.Helper()
 
 	fn := filepath.Join(t.TempDir(), "test-measurement.out")
-	cm, err := experiment.NewCatchUpMsr(fn, armNs, windowNs)
+	cm, err := experiment.NewCatchUpMsr(fn, armNs, windowNs, sealGraceNs)
 	require.NoError(t, err, "NewCatchUpMsr() failed")
 	t.Cleanup(cm.Close)
 
@@ -49,6 +57,14 @@ func newArmedTestMsr(t *testing.T, armNs, windowNs int64) (*experiment.CatchUpMs
 		}
 		return strings.Split(strings.TrimSuffix(string(data), "\n"), "\n")
 	}
+}
+
+// acked is the leader-side state stepLeader hands down on every response it steps. The
+// follower's acknowledged index is the only field most tests care about: it is what decides
+// whether an episode reached its target, which is why the snapshot is required whether or not
+// debug output is on.
+func acked(match uint64) experiment.CatchUpSnapshot {
+	return experiment.CatchUpSnapshot{FollowerMatch: match}
 }
 
 // parseLine breaks a "<phase>:<followerID>:<startNs>:<durationNs>" record apart, ignoring
@@ -109,11 +125,11 @@ func TestCatchUpMsr_Episodes(t *testing.T) {
 		{
 			name: "episode records both phases from a single start",
 			measurement: func(t *testing.T, cm *experiment.CatchUpMsr) {
-				cm.Start(follower2, 100, 40)
+				cm.Start(follower2, 100, 40, 0)
 				time.Sleep(5 * time.Millisecond)
-				cm.EndRecovery(follower2, nowNs())
+				cm.EndRecovery(follower2, nowNs(), acked(60))
 				time.Sleep(5 * time.Millisecond)
-				cm.EndReplication(follower2, nowNs())
+				cm.EndReplication(follower2, nowNs(), acked(100))
 			},
 			expectedN: 2,
 			assertions: func(t *testing.T, lines []string) {
@@ -131,14 +147,14 @@ func TestCatchUpMsr_Episodes(t *testing.T) {
 		{
 			name: "one ack closing both phases records the same duration twice",
 			measurement: func(t *testing.T, cm *experiment.CatchUpMsr) {
-				cm.Start(follower2, 100, 40)
+				cm.Start(follower2, 100, 40, 0)
 				time.Sleep(5 * time.Millisecond)
 
 				// stepLeader samples the end instant once and hands it to both phases, so
 				// persisting the recovery line cannot inflate the replication one.
 				end := nowNs()
-				cm.EndRecovery(follower2, end)
-				cm.EndReplication(follower2, end)
+				cm.EndRecovery(follower2, end, acked(100))
+				cm.EndReplication(follower2, end, acked(100))
 			},
 			expectedN: 2,
 			assertions: func(t *testing.T, lines []string) {
@@ -148,15 +164,30 @@ func TestCatchUpMsr_Episodes(t *testing.T) {
 			},
 		},
 		{
+			name: "an ack short of the target leaves the episode in flight",
+			measurement: func(t *testing.T, cm *experiment.CatchUpMsr) {
+				cm.Start(follower2, 100, 40, 0)
+				cm.EndReplication(follower2, nowNs(), acked(99))
+				assert.True(t, cm.IsActive(follower2), "the backlog is not replicated yet")
+
+				cm.EndReplication(follower2, nowNs(), acked(100))
+				assert.False(t, cm.IsActive(follower2))
+			},
+			expectedN: 2,
+			assertions: func(t *testing.T, lines []string) {
+				assert.Equal(t, []string{"recovery", "replication"}, phasesOf(t, lines))
+			},
+		},
+		{
 			name: "each follower records its own episodes",
 			measurement: func(t *testing.T, cm *experiment.CatchUpMsr) {
-				cm.Start(follower2, 100, 40)
-				cm.EndRecovery(follower2, nowNs())
-				cm.EndReplication(follower2, nowNs())
+				cm.Start(follower2, 100, 40, 0)
+				cm.EndRecovery(follower2, nowNs(), acked(100))
+				cm.EndReplication(follower2, nowNs(), acked(100))
 
-				cm.Start(follower3, 200, 150)
-				cm.EndRecovery(follower3, nowNs())
-				cm.EndReplication(follower3, nowNs())
+				cm.Start(follower3, 200, 150, 0)
+				cm.EndRecovery(follower3, nowNs(), acked(200))
+				cm.EndReplication(follower3, nowNs(), acked(200))
 			},
 			expectedN: 4,
 			assertions: func(t *testing.T, lines []string) {
@@ -172,15 +203,15 @@ func TestCatchUpMsr_Episodes(t *testing.T) {
 			name: "an early episode on one follower does not suppress a later one on another",
 			measurement: func(t *testing.T, cm *experiment.CatchUpMsr) {
 				// The artifact: follower2 opens and completes an episode first.
-				cm.Start(follower2, 100, 40)
-				cm.EndRecovery(follower2, nowNs())
-				cm.EndReplication(follower2, nowNs())
+				cm.Start(follower2, 100, 40, 0)
+				cm.EndRecovery(follower2, nowNs(), acked(100))
+				cm.EndReplication(follower2, nowNs(), acked(100))
 
 				// The real event: follower3 only becomes quorum-critical later.
-				cm.Start(follower3, 5000, 1200)
+				cm.Start(follower3, 5000, 1200, 0)
 				assert.True(t, cm.IsActive(follower3), "an unrelated follower must still be measurable")
-				cm.EndRecovery(follower3, nowNs())
-				cm.EndReplication(follower3, nowNs())
+				cm.EndRecovery(follower3, nowNs(), acked(5000))
+				cm.EndReplication(follower3, nowNs(), acked(5000))
 			},
 			expectedN: 4,
 			assertions: func(t *testing.T, lines []string) {
@@ -195,19 +226,15 @@ func TestCatchUpMsr_Episodes(t *testing.T) {
 			// real event exactly this way.
 			name: "a follower records every episode it opens inside the window",
 			measurement: func(t *testing.T, cm *experiment.CatchUpMsr) {
-				cm.Start(follower3, 100, 40)
-				cm.EndRecovery(follower3, nowNs())
-				cm.EndReplication(follower3, nowNs())
+				cm.Start(follower3, 100, 40, 0)
+				cm.EndRecovery(follower3, nowNs(), acked(100))
+				cm.EndReplication(follower3, nowNs(), acked(100))
 
-				cm.Start(follower3, 5000, 1200)
+				cm.Start(follower3, 5000, 1200, 0)
 				assert.True(t, cm.IsActive(follower3), "a recorded follower may open another episode")
 
-				target, ok := cm.Target(follower3)
-				assert.True(t, ok)
-				assert.Equal(t, uint64(5000), target, "the second episode carries its own backlog")
-
-				cm.EndRecovery(follower3, nowNs())
-				cm.EndReplication(follower3, nowNs())
+				cm.EndRecovery(follower3, nowNs(), acked(5000))
+				cm.EndReplication(follower3, nowNs(), acked(5000))
 			},
 			expectedN: 4,
 			assertions: func(t *testing.T, lines []string) {
@@ -219,34 +246,16 @@ func TestCatchUpMsr_Episodes(t *testing.T) {
 			},
 		},
 		{
-			// The episode stays in flight to keep timing its replication, so it — not a
-			// retirement latch — is what stops a second recovery line being emitted for
-			// the same catch-up.
-			name: "an in-flight episode blocks a second recovery line",
-			measurement: func(t *testing.T, cm *experiment.CatchUpMsr) {
-				cm.Start(follower2, 100, 40)
-				cm.EndRecovery(follower2, nowNs())
-
-				cm.Cancel(follower2)
-				cm.Start(follower2, 900, 850)
-				cm.EndRecovery(follower2, nowNs())
-			},
-			expectedN: 1,
-			assertions: func(t *testing.T, lines []string) {
-				phase, _, _, _ := parseLine(t, lines[0])
-				assert.Equal(t, "recovery", phase)
-			},
-		},
-		{
 			name: "cancel discards an episode without recording anything",
 			measurement: func(t *testing.T, cm *experiment.CatchUpMsr) {
-				cm.Start(follower2, 100, 40)
+				cm.Start(follower2, 100, 40, 0)
 				cm.Cancel(follower2)
 				assert.Zero(t, cm.EpisodeCount(follower2), "a cancelled episode records nothing")
+				assert.False(t, cm.IsActive(follower2))
 
-				cm.Start(follower2, 200, 150)
-				cm.EndRecovery(follower2, nowNs())
-				cm.EndReplication(follower2, nowNs())
+				cm.Start(follower2, 200, 150, 0)
+				cm.EndRecovery(follower2, nowNs(), acked(200))
+				cm.EndReplication(follower2, nowNs(), acked(200))
 			},
 			expectedN: 2,
 			assertions: func(t *testing.T, lines []string) {
@@ -256,20 +265,38 @@ func TestCatchUpMsr_Episodes(t *testing.T) {
 		{
 			name: "cancel is a no-op once the recovery phase was recorded",
 			measurement: func(t *testing.T, cm *experiment.CatchUpMsr) {
-				cm.Start(follower2, 100, 40)
-				cm.EndRecovery(follower2, nowNs())
+				cm.Start(follower2, 100, 40, 0)
+				cm.EndRecovery(follower2, nowNs(), acked(60))
 
 				cm.Cancel(follower2)
-				cm.EndReplication(follower2, nowNs())
+				assert.True(t, cm.IsActive(follower2), "it is tracking pure replication now")
+				cm.EndReplication(follower2, nowNs(), acked(100))
+			},
+			expectedN: 2,
+		},
+		{
+			name: "cancel spares recovered episodes and drops the rest",
+			measurement: func(t *testing.T, cm *experiment.CatchUpMsr) {
+				cm.Start(follower2, 100, 40, 0)
+				cm.EndRecovery(follower2, nowNs(), acked(60))
+
+				cm.Start(follower2, 200, 60, 0)
+				require.Equal(t, 2, cm.OpenEpisodeCount(follower2))
+
+				cm.Cancel(follower2)
+				assert.Equal(t, 1, cm.OpenEpisodeCount(follower2),
+					"only the episode still waiting on quorum is discarded")
+
+				cm.EndReplication(follower2, nowNs(), acked(100))
 			},
 			expectedN: 2,
 		},
 		{
 			name: "replication ending first still emits both phases",
 			measurement: func(t *testing.T, cm *experiment.CatchUpMsr) {
-				cm.Start(follower2, 100, 40)
+				cm.Start(follower2, 100, 40, 0)
 				time.Sleep(5 * time.Millisecond)
-				cm.EndReplication(follower2, nowNs())
+				cm.EndReplication(follower2, nowNs(), acked(100))
 			},
 			expectedN: 2,
 			assertions: func(t *testing.T, lines []string) {
@@ -279,58 +306,31 @@ func TestCatchUpMsr_Episodes(t *testing.T) {
 		{
 			name: "ending without a start does nothing",
 			measurement: func(t *testing.T, cm *experiment.CatchUpMsr) {
-				cm.EndRecovery(follower2, nowNs())
-				cm.EndReplication(follower2, nowNs())
+				cm.EndRecovery(follower2, nowNs(), acked(100))
+				cm.EndReplication(follower2, nowNs(), acked(100))
 			},
 			expectedN: 0,
 		},
 		{
 			name: "start without end",
 			measurement: func(t *testing.T, cm *experiment.CatchUpMsr) {
-				cm.Start(follower2, 100, 40)
+				cm.Start(follower2, 100, 40, 0)
 				// Don't end the episode - should not panic
 			},
 			expectedN: 0,
 		},
 		{
-			name: "repeated starts before end avoid overwriting the episode",
-			measurement: func(t *testing.T, cm *experiment.CatchUpMsr) {
-				cm.Start(follower2, 100, 40)
-				time.Sleep(10 * time.Millisecond)
-
-				// Second Start() call should be ignored due to protection, keeping the
-				// original start instant, backlog target, and follower start index.
-				cm.Start(follower2, 900, 850)
-				target, ok := cm.Target(follower2)
-				assert.True(t, ok)
-				assert.Equal(t, uint64(100), target)
-
-				followerStart, ok := cm.FollowerStartIndex(follower2)
-				assert.True(t, ok)
-				assert.Equal(t, uint64(40), followerStart)
-
-				cm.EndRecovery(follower2, nowNs())
-				cm.EndReplication(follower2, nowNs())
-			},
-			expectedN: 2,
-			assertions: func(t *testing.T, lines []string) {
-				_, _, _, recDur := parseLine(t, lines[0])
-				assert.Greater(t, recDur, int64(10*time.Millisecond),
-					"the duration must be measured from the first Start()")
-			},
-		},
-		{
 			name: "two followers are tracked concurrently and both record",
 			measurement: func(t *testing.T, cm *experiment.CatchUpMsr) {
-				cm.Start(follower2, 100, 40)
-				cm.Start(follower3, 200, 150)
+				cm.Start(follower2, 100, 40, 0)
+				cm.Start(follower3, 200, 150, 0)
 				assert.ElementsMatch(t, []uint64{follower2, follower3}, cm.ActiveFollowers())
 
-				cm.EndRecovery(follower3, nowNs())
-				cm.EndReplication(follower3, nowNs())
+				cm.EndRecovery(follower3, nowNs(), acked(200))
+				cm.EndReplication(follower3, nowNs(), acked(200))
 
-				cm.EndRecovery(follower2, nowNs())
-				cm.EndReplication(follower2, nowNs())
+				cm.EndRecovery(follower2, nowNs(), acked(100))
+				cm.EndReplication(follower2, nowNs(), acked(100))
 			},
 			expectedN: 4,
 			assertions: func(t *testing.T, lines []string) {
@@ -354,17 +354,119 @@ func TestCatchUpMsr_Episodes(t *testing.T) {
 	}
 }
 
+// TestCatchUpMsr_ConcurrentEpisodes is the regression test for the 7-catchup-v6 round, where 19
+// of 78 runs recorded nothing for the follower whose recovery the experiment exists to measure.
+//
+// The recorder kept one *open* episode per follower and dropped any rejection arriving while it
+// was in flight. Under load the delayed follower opens an episode within milliseconds of the
+// window opening, holding a backlog it cannot clear for tens of seconds — in the real data,
+// 141k to 731k entries — so it was still holding the slot several seconds later when the
+// failure landed, and the episode the analysis needed was never created. No placement of the
+// window fixes that: the block is concurrency, not timing.
+func TestCatchUpMsr_ConcurrentEpisodes(t *testing.T) {
+	t.Run("a stuck episode does not stop a later one from opening", func(t *testing.T) {
+		cm, recorded := newTestMsr(t)
+
+		// The blip: opens at the top of the window against a backlog it will never clear.
+		cm.Start(follower3, 512003, 40, 0)
+		cm.EndReplication(follower3, nowNs(), acked(56945))
+		require.True(t, cm.IsActive(follower3))
+		require.Equal(t, 1, cm.OpenEpisodeCount(follower3))
+
+		time.Sleep(5 * time.Millisecond)
+
+		// The injected failure, several seconds later in a real run. Under v6 this Start was
+		// dropped on the floor and the run recorded nothing at or after the kill.
+		cm.Start(follower3, 512500, 56945, 0)
+		require.Equal(t, 2, cm.OpenEpisodeCount(follower3),
+			"the second episode must open while the first is still in flight")
+
+		// The follower finally catches up, closing both — each timed from its own start.
+		end := nowNs()
+		cm.EndRecovery(follower3, end, acked(512500))
+		cm.EndReplication(follower3, end, acked(512500))
+
+		lines := recorded()
+		require.Len(t, lines, 4)
+		assert.Equal(t, []string{"recovery", "recovery", "replication", "replication"},
+			phasesOf(t, lines))
+
+		_, _, blipStart, blipDur := parseLine(t, lines[2])
+		_, _, realStart, realDur := parseLine(t, lines[3])
+		assert.Greater(t, realStart, blipStart, "each episode carries its own start instant")
+		assert.Greater(t, blipDur, realDur,
+			"the older episode has been running longer, so it reports the larger duration")
+	})
+
+	// The outcome that actually matters at the saturated load points: neither episode ever
+	// completes, but the later one still exists and is still timestamped after the kill, so the
+	// offline selection has something to find. v6 produced a single line here, timestamped
+	// before the kill, and the run was scored as a miss.
+	t.Run("both stuck episodes are abandoned under their own start instants", func(t *testing.T) {
+		window := 40 * time.Millisecond
+		cm, recorded := newSealTestMsr(t, time.Now().UnixNano(), int64(window), int64(window))
+
+		cm.Start(follower3, 512003, 40, 0)
+		time.Sleep(5 * time.Millisecond)
+		cm.Start(follower3, 512500, 40, 0)
+		cm.EndReplication(follower3, nowNs(), acked(56945))
+
+		time.Sleep(3 * window)
+		cm.Cancel(follower2) // any entry point seals
+
+		lines := recorded()
+		require.Len(t, lines, 2)
+		assert.Equal(t, []string{"abandoned", "abandoned"}, phasesOf(t, lines))
+		assert.Equal(t, 2, cm.EpisodeCount(follower3))
+
+		_, _, firstStart, _ := parseLine(t, lines[0])
+		_, _, secondStart, _ := parseLine(t, lines[1])
+		assert.Greater(t, secondStart, firstStart,
+			"the later episode is what a post-kill selection has to be able to find")
+
+		// How far the follower actually got, which is the whole point of an abandoned line.
+		assert.Contains(t, lines[0], "logEntries:511963")
+		assert.Contains(t, lines[0], "acked:56905")
+	})
+}
+
+// TestCatchUpMsr_RecoveryClosesAllPending covers the soundness argument for settling every open
+// episode at once: the caller only reaches that path when maybeCommit() returned true, and the
+// sole progress mutation in that branch is this follower's, so the acknowledgement that restored
+// quorum restored it for every episode of that follower still waiting on it.
+func TestCatchUpMsr_RecoveryClosesAllPending(t *testing.T) {
+	cm, recorded := newTestMsr(t)
+
+	cm.Start(follower3, 100, 40, 0)
+	cm.Start(follower3, 200, 60, 0)
+	cm.Start(follower3, 300, 80, 0)
+	cm.Start(follower2, 900, 500, 0)
+
+	cm.EndRecovery(follower3, nowNs(), acked(90))
+
+	lines := recorded()
+	require.Len(t, lines, 3, "one recovery line per open episode of that follower")
+	assert.Equal(t, []string{"recovery", "recovery", "recovery"}, phasesOf(t, lines))
+	assert.Equal(t, []uint64{follower3, follower3, follower3}, idsOf(t, lines),
+		"another follower's episodes are untouched")
+	assert.Equal(t, 3, cm.OpenEpisodeCount(follower3), "they live on to time their replication")
+
+	// A second commit-advancing ack must not re-emit any of them.
+	cm.EndRecovery(follower3, nowNs(), acked(95))
+	assert.Len(t, recorded(), 3)
+}
+
 func TestCatchUpMsr_Arming(t *testing.T) {
 	t.Run("an arm instant in the future records nothing", func(t *testing.T) {
 		cm, recorded := newArmedTestMsr(t, time.Now().Add(time.Hour).UnixNano(), 0)
 		assert.False(t, cm.IsArmed())
 
-		cm.Start(follower3, 100, 40)
+		cm.Start(follower3, 100, 40, 0)
 		assert.False(t, cm.IsActive(follower3), "no episode may open before the arm instant")
 		assert.False(t, cm.HasActive())
 
-		cm.EndRecovery(follower3, nowNs())
-		cm.EndReplication(follower3, nowNs())
+		cm.EndRecovery(follower3, nowNs(), acked(100))
+		cm.EndReplication(follower3, nowNs(), acked(100))
 
 		assert.Empty(t, recorded(), "a run whose arm instant is never reached records nothing")
 		assert.Zero(t, cm.EpisodeCount(follower3))
@@ -374,10 +476,10 @@ func TestCatchUpMsr_Arming(t *testing.T) {
 		cm, recorded := newArmedTestMsr(t, time.Now().Add(-time.Hour).UnixNano(), 0)
 		assert.True(t, cm.IsArmed())
 
-		cm.Start(follower2, 100, 40)
+		cm.Start(follower2, 100, 40, 0)
 		require.True(t, cm.IsActive(follower2))
-		cm.EndRecovery(follower2, nowNs())
-		cm.EndReplication(follower2, nowNs())
+		cm.EndRecovery(follower2, nowNs(), acked(100))
+		cm.EndReplication(follower2, nowNs(), acked(100))
 
 		lines := recorded()
 		require.Len(t, lines, 2)
@@ -395,24 +497,20 @@ func TestCatchUpMsr_Arming(t *testing.T) {
 		cm, recorded := newArmedTestMsr(t, armNs, 0)
 
 		// Load onset, before the failure window: opens and completes, records nothing.
-		cm.Start(follower3, 100, 40)
-		cm.EndRecovery(follower3, nowNs())
-		cm.EndReplication(follower3, nowNs())
+		cm.Start(follower3, 100, 40, 0)
+		cm.EndRecovery(follower3, nowNs(), acked(100))
+		cm.EndReplication(follower3, nowNs(), acked(100))
 		require.Empty(t, recorded(), "a pre-arm episode is not the event being measured")
 
 		time.Sleep(30 * time.Millisecond)
 		require.True(t, cm.IsArmed())
 
 		// The injected failure: the same follower becomes quorum-critical once armed.
-		cm.Start(follower3, 5000, 1200)
+		cm.Start(follower3, 5000, 1200, 0)
 		require.True(t, cm.IsActive(follower3), "the real episode must still be able to open")
 
-		target, ok := cm.Target(follower3)
-		assert.True(t, ok)
-		assert.Equal(t, uint64(5000), target, "the real episode carries its own backlog")
-
-		cm.EndRecovery(follower3, nowNs())
-		cm.EndReplication(follower3, nowNs())
+		cm.EndRecoveryDebug(follower3, nowNs(), acked(5000))
+		cm.EndReplicationDebug(follower3, nowNs(), acked(5000))
 
 		lines := recorded()
 		require.Len(t, lines, 2)
@@ -421,6 +519,7 @@ func TestCatchUpMsr_Arming(t *testing.T) {
 			assert.Equal(t, follower3, id)
 			assert.GreaterOrEqual(t, startNs, armNs, "only a post-arm episode may be recorded")
 		}
+		assert.Contains(t, lines[0], "target:5000", "the real episode carries its own backlog")
 	})
 }
 
@@ -431,30 +530,30 @@ func TestCatchUpMsr_Window(t *testing.T) {
 		cm, recorded := newArmedTestMsr(t, armNs, int64(time.Hour))
 		assert.False(t, cm.IsArmed(), "the window is the whole of what arming means")
 
-		cm.Start(follower3, 100, 40)
+		cm.Start(follower3, 100, 40, 0)
 		assert.False(t, cm.IsActive(follower3), "no episode may open once the window closed")
 
-		cm.EndRecovery(follower3, nowNs())
-		cm.EndReplication(follower3, nowNs())
+		cm.EndRecovery(follower3, nowNs(), acked(100))
+		cm.EndReplication(follower3, nowNs(), acked(100))
 
 		assert.Empty(t, recorded())
 	})
 
-	// The property that makes a 10s window enough for a catch-up that runs for half a
+	// The property that makes a 15s window enough for a catch-up that runs for half a
 	// minute: the bound is on when an episode opens, never on when it finishes.
 	t.Run("an episode opening inside the window is recorded however late it ends", func(t *testing.T) {
 		window := 200 * time.Millisecond
 		cm, recorded := newArmedTestMsr(t, time.Now().UnixNano(), int64(window))
 
-		cm.Start(follower3, 5000, 1200)
+		cm.Start(follower3, 5000, 1200, 0)
 		require.True(t, cm.IsActive(follower3))
 
 		// Past the window's end, but inside the grace the seal deadline allows.
 		time.Sleep(window + 50*time.Millisecond)
 		require.False(t, cm.IsArmed(), "the window itself has closed")
 
-		cm.EndRecovery(follower3, nowNs())
-		cm.EndReplication(follower3, nowNs())
+		cm.EndRecovery(follower3, nowNs(), acked(5000))
+		cm.EndReplication(follower3, nowNs(), acked(5000))
 
 		lines := recorded()
 		require.Len(t, lines, 2)
@@ -469,9 +568,9 @@ func TestCatchUpMsr_Window(t *testing.T) {
 		armNs := time.Now().UnixNano()
 		cm, recorded := newArmedTestMsr(t, armNs, int64(window))
 
-		cm.Start(follower3, 5000, 1200)
-		cm.Observe(follower3, 3000)
-		require.True(t, cm.IsActive(follower3))
+		cm.Start(follower3, 5000, 1200, 0)
+		cm.EndReplication(follower3, nowNs(), acked(3000))
+		require.True(t, cm.IsActive(follower3), "still short of its target")
 
 		// Past arm+2*window, so the episode is written off.
 		time.Sleep(3 * window)
@@ -499,13 +598,13 @@ func TestCatchUpMsr_Window(t *testing.T) {
 		window := 30 * time.Millisecond
 		cm, recorded := newArmedTestMsr(t, time.Now().UnixNano(), int64(window))
 
-		cm.Start(follower2, 100, 40)
-		cm.Start(follower3, 200, 150)
+		cm.Start(follower2, 100, 40, 0)
+		cm.Start(follower3, 200, 150, 0)
 		time.Sleep(3 * window)
 
-		cm.Start(follower2, 300, 250)
-		cm.EndRecovery(follower2, nowNs())
-		cm.EndReplication(follower3, nowNs())
+		cm.Start(follower2, 300, 250, 0)
+		cm.EndRecovery(follower2, nowNs(), acked(300))
+		cm.EndReplication(follower3, nowNs(), acked(300))
 		cm.Cancel(follower3)
 
 		lines := recorded()
@@ -522,10 +621,10 @@ func TestCatchUpMsr_Window(t *testing.T) {
 		cm, recorded := newArmedTestMsr(t, 0, int64(time.Hour))
 		assert.True(t, cm.IsArmed(), "an unset arm instant means armed from the process start")
 
-		cm.Start(follower3, 100, 40)
+		cm.Start(follower3, 100, 40, 0)
 		require.True(t, cm.IsActive(follower3))
-		cm.EndRecovery(follower3, nowNs())
-		cm.EndReplication(follower3, nowNs())
+		cm.EndRecovery(follower3, nowNs(), acked(100))
+		cm.EndReplication(follower3, nowNs(), acked(100))
 
 		assert.Len(t, recorded(), 2)
 	})
@@ -533,7 +632,7 @@ func TestCatchUpMsr_Window(t *testing.T) {
 	t.Run("an unbounded window never seals", func(t *testing.T) {
 		cm, recorded := newArmedTestMsr(t, time.Now().Add(-time.Hour).UnixNano(), 0)
 
-		cm.Start(follower3, 5000, 1200)
+		cm.Start(follower3, 5000, 1200, 0)
 		time.Sleep(20 * time.Millisecond)
 
 		cm.Cancel(follower2)
@@ -542,35 +641,100 @@ func TestCatchUpMsr_Window(t *testing.T) {
 	})
 }
 
+// TestCatchUpMsr_SealGrace covers the knob that lets the window be widened without pushing the
+// deadline past the end of the run. In 7-catchup-v6 the deadline was armNs+2*windowNs, so a
+// window long enough to be sure of catching the failure also moved the deadline past the instant
+// the harness kills etcd — and the abandoned lines, the only evidence a follower never caught up,
+// were never written at all.
+func TestCatchUpMsr_SealGrace(t *testing.T) {
+	t.Run("the deadline is the window plus the grace, not two windows", func(t *testing.T) {
+		window := 200 * time.Millisecond
+		grace := 30 * time.Millisecond
+		cm, recorded := newSealTestMsr(t, time.Now().UnixNano(), int64(window), int64(grace))
+
+		cm.Start(follower3, 5000, 1200, 0)
+
+		// Past window+grace but far short of the v6 deadline of two windows.
+		time.Sleep(window + 2*grace)
+		cm.Cancel(follower2)
+
+		lines := recorded()
+		require.Len(t, lines, 1, "a short grace must seal well before a second window elapses")
+		assert.Equal(t, []string{"abandoned"}, phasesOf(t, lines))
+	})
+
+	t.Run("an unset grace falls back to the window", func(t *testing.T) {
+		window := 40 * time.Millisecond
+		cm, recorded := newSealTestMsr(t, time.Now().UnixNano(), int64(window), 0)
+
+		cm.Start(follower3, 5000, 1200, 0)
+
+		// Past the window, short of arm+2*window: the v6 deadline has not been reached.
+		time.Sleep(window + window/2)
+		cm.Cancel(follower2)
+		require.Empty(t, recorded(), "an unset grace must reproduce the v6 deadline exactly")
+
+		time.Sleep(window)
+		cm.Cancel(follower2)
+		assert.Len(t, recorded(), 1)
+	})
+}
+
+// TestCatchUpMsr_OpenEpisodeEviction covers the bound on concurrently open episodes. Dropping the
+// oldest is deliberate: the analysis wants the first episode opening at or after the injected
+// failure, so the newest are the ones worth protecting.
+func TestCatchUpMsr_OpenEpisodeEviction(t *testing.T) {
+	const openCap = 128
+
+	window := 50 * time.Millisecond
+	cm, recorded := newSealTestMsr(t, time.Now().UnixNano(), int64(window), int64(window))
+
+	for i := 0; i < openCap+3; i++ {
+		cm.Start(follower3, uint64(1000+i), 40, 0)
+	}
+
+	assert.Equal(t, openCap, cm.OpenEpisodeCount(follower3), "the open set is bounded")
+	assert.Equal(t, 3, cm.EvictedCount(follower3), "and what it dropped is counted")
+
+	time.Sleep(3 * window)
+	cm.Cancel(follower2)
+
+	lines := recorded()
+	require.Len(t, lines, openCap+1, "one abandoned line per survivor, plus one eviction summary")
+
+	phases := phasesOf(t, lines)
+	assert.Equal(t, "abandoned", phases[0])
+
+	// The summary is last, and unlike every other line its final field is a count, not a
+	// duration. A drop nobody can see is what cost 6-catchup-v5 and 7-catchup-v6 their captures.
+	summary := lines[len(lines)-1]
+	phase, id, _, count := parseLine(t, summary)
+	assert.Equal(t, "evicted", phase)
+	assert.Equal(t, follower3, id)
+	assert.Equal(t, int64(3), count)
+
+	// The oldest went, so the surviving span starts at the fourth target opened.
+	assert.Contains(t, lines[0], fmt.Sprintf("target:%d", 1003))
+}
+
 func TestCatchUpMsr_EpisodeState(t *testing.T) {
 	cm, recorded := newTestMsr(t)
 
 	assert.True(t, cm.IsArmed(), "an unset arm instant measures from the start")
 	assert.False(t, cm.IsActive(follower2))
 	assert.Zero(t, cm.EpisodeCount(follower2))
+	assert.Zero(t, cm.OpenEpisodeCount(follower2))
+	assert.Zero(t, cm.EvictedCount(follower2))
 	assert.False(t, cm.HasActive())
 	assert.Empty(t, cm.ActiveFollowers())
 
-	_, ok := cm.Target(follower2)
-	assert.False(t, ok)
-
-	_, ok = cm.FollowerStartIndex(follower2)
-	assert.False(t, ok)
-
-	cm.Start(follower2, 42, 20)
+	cm.Start(follower2, 42, 20, 0)
 	assert.True(t, cm.IsActive(follower2))
 	assert.True(t, cm.HasActive())
+	assert.Equal(t, 1, cm.OpenEpisodeCount(follower2))
 	assert.ElementsMatch(t, []uint64{follower2}, cm.ActiveFollowers())
 
-	target, ok := cm.Target(follower2)
-	assert.True(t, ok)
-	assert.Equal(t, uint64(42), target)
-
-	followerStart, ok := cm.FollowerStartIndex(follower2)
-	assert.True(t, ok)
-	assert.Equal(t, uint64(20), followerStart)
-
-	cm.Start(follower3, 43, 21)
+	cm.Start(follower3, 43, 21, 0)
 	assert.ElementsMatch(t, []uint64{follower2, follower3}, cm.ActiveFollowers())
 
 	cm.Cancel(follower3)
@@ -578,20 +742,20 @@ func TestCatchUpMsr_EpisodeState(t *testing.T) {
 	assert.Zero(t, cm.EpisodeCount(follower3), "a cancelled episode contributes nothing")
 	assert.ElementsMatch(t, []uint64{follower2}, cm.ActiveFollowers())
 
-	cm.EndRecovery(follower2, nowNs())
+	cm.EndRecovery(follower2, nowNs(), acked(30))
 	assert.True(t, cm.IsActive(follower2), "the episode lives on to time its replication")
 	assert.Zero(t, cm.EpisodeCount(follower2), "an episode counts only once it is closed out")
 
-	cm.EndReplication(follower2, nowNs())
+	cm.EndReplication(follower2, nowNs(), acked(42))
 	assert.False(t, cm.IsActive(follower2))
 	assert.Equal(t, 1, cm.EpisodeCount(follower2))
 	assert.False(t, cm.HasActive())
 	assert.Empty(t, cm.ActiveFollowers())
 
-	cm.Start(follower2, 44, 22)
+	cm.Start(follower2, 44, 22, 0)
 	assert.True(t, cm.IsActive(follower2), "a follower keeps recording for as long as the window is open")
 
-	cm.Start(follower3, 44, 22)
+	cm.Start(follower3, 44, 22, 0)
 	assert.True(t, cm.IsActive(follower3), "another follower stays measurable")
 
 	assert.Len(t, recorded(), 2)
@@ -600,38 +764,31 @@ func TestCatchUpMsr_EpisodeState(t *testing.T) {
 func TestCatchUpMsr_Debug(t *testing.T) {
 	cm, recorded := newTestMsr(t)
 
-	info := experiment.CatchUpDebugInfo{
+	// followerStartIndex of 9 against a target of 18 is what raft.go's rejection branch would
+	// snapshot: logEntries is 18 - 9, derived by the recorder rather than passed in, because one
+	// acknowledgement can close several episodes and the caller cannot build a payload per
+	// episode when it does not know how many there are.
+	cm.Start(follower2, 18, 9, 125_000_000)
+
+	cm.EndRecoveryDebug(follower2, nowNs(), experiment.CatchUpSnapshot{
 		FollowerID:       follower2,
-		LogEntries:       9,
-		AckedEntries:     0,
-		TargetIndex:      18,
-		CommitStallNs:    125_000_000,
 		LeaderFirstIndex: 10,
 		LeaderLastIndex:  18,
 		LeaderCommitted:  17,
 		LeaderApplied:    16,
-		FollowerMatch:    9,
-		FollowerNext:     10,
-	}
+		FollowerMatch:    18,
+		FollowerNext:     19,
+	})
 
-	// followerStartIndex of 9 mirrors info.LogEntries: 18 - 9 = 9, i.e. what
-	// catchUpDebugInfo in raft.go would compute for this target/start pair.
-	cm.StartDebug(follower2, info.TargetIndex, 9, info)
-
-	info.AckedEntries = 9
-	info.FollowerMatch = 18
-	info.FollowerNext = 19
-	cm.EndRecoveryDebug(follower2, nowNs(), info)
-
-	info.LeaderLastIndex = 24
-	info.AckedEntries = 11
-	info.FollowerMatch = 20
-	info.FollowerNext = 21
-
-	// The stall is a property of the episode, so a later value handed in here must not
-	// reach the line: every line of one episode reports the stall as it was at its start.
-	info.CommitStallNs = 999
-	cm.EndReplicationDebug(follower2, nowNs(), info)
+	cm.EndReplicationDebug(follower2, nowNs(), experiment.CatchUpSnapshot{
+		FollowerID:       follower2,
+		LeaderFirstIndex: 10,
+		LeaderLastIndex:  24,
+		LeaderCommitted:  17,
+		LeaderApplied:    16,
+		FollowerMatch:    20,
+		FollowerNext:     21,
+	})
 
 	lines := recorded()
 	require.Len(t, lines, 2)
@@ -654,6 +811,24 @@ func TestCatchUpMsr_Debug(t *testing.T) {
 	assert.Contains(t, lines[1], "target:18")
 	assert.Contains(t, lines[1], "acked:11")
 	assert.Contains(t, lines[1], "follower:{id:2, match:20, next:21}")
-	assert.Contains(t, lines[1], "commitStallNs:125000000",
-		"the stall must be the episode's, not the one passed at the end")
+
+	// The stall is a property of the episode, so every line of one episode reports it as it was
+	// at that episode's start rather than at the instant a phase closed.
+	assert.Contains(t, lines[1], "commitStallNs:125000000")
+}
+
+// A run that configures nothing writes bare lines: the debug payload is the only thing the flag
+// controls, since the snapshot itself is needed either way to decide when an episode is done.
+func TestCatchUpMsr_NoDebugPayload(t *testing.T) {
+	cm, recorded := newTestMsr(t)
+
+	cm.Start(follower2, 100, 40, 125_000_000)
+	cm.EndRecovery(follower2, nowNs(), acked(100))
+	cm.EndReplication(follower2, nowNs(), acked(100))
+
+	lines := recorded()
+	require.Len(t, lines, 2)
+	for _, line := range lines {
+		assert.NotContains(t, line, "[", "no payload without the debug flag: %s", line)
+	}
 }

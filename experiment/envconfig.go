@@ -46,6 +46,13 @@ const (
 	// bound, i.e. record every episode from the arm instant to the end of the run.
 	MeasureFollowerCatchUpWindow = "RAFT_MEASURE_FOLLOWER_CATCHUP_WINDOW"
 
+	// MeasureFollowerCatchUpSealGrace holds how long, as a Go duration string, the recorder
+	// waits past the window's end before writing off whatever is still in flight as abandoned.
+	// An episode opening at the very last instant of the window deserves the same time to
+	// finish as one opening at its start, which is why the deadline sits past the window rather
+	// than at it.
+	MeasureFollowerCatchUpSealGrace = "RAFT_MEASURE_FOLLOWER_CATCHUP_SEAL_GRACE"
+
 	// MeasureFollowerCatchUpDebugEnabled enables extra fields in catch-up
 	// measurements to help inspect log replication during recovery.
 	MeasureFollowerCatchUpDebugEnabled = "RAFT_MEASURE_FOLLOWER_CATCHUP_DEBUG_ENABLED"
@@ -138,7 +145,7 @@ func LoadEnvConfig() {
 			fn = defaultFollowerCatchUpFilename
 		}
 
-		Config.CatchUpMsr, err = NewCatchUpMsr(fn, catchUpArmNs(), catchUpWindowNs())
+		Config.CatchUpMsr, err = NewCatchUpMsr(fn, catchUpArmNs(), catchUpWindowNs(), catchUpSealGraceNs())
 		if err != nil {
 			log.Fatalln(err)
 		}
@@ -195,11 +202,21 @@ func catchUpArmNs() int64 {
 
 // NOTE (Gus): the configured recording window, in ns. Same never-abort contract as
 // catchUpArmNs: absent, unparsable, zero or negative all mean 0, i.e. no upper bound —
-// the behaviour of a run that arms but never stops recording. The upper bound keeps
-// armNs+2*windowNs (the seal deadline, see catchup_measurement.go) from overflowing, and
-// no experiment has any use for a window measured in days.
+// the behaviour of a run that arms but never stops recording.
 func catchUpWindowNs() int64 {
-	raw, exists := os.LookupEnv(MeasureFollowerCatchUpWindow)
+	return parseEnvDurationNs(MeasureFollowerCatchUpWindow)
+}
+
+// NOTE (Gus): the configured grace past the window's end before in-flight episodes are written
+// off as abandoned. Same never-abort contract; 0 means "fall back to the window".
+func catchUpSealGraceNs() int64 {
+	return parseEnvDurationNs(MeasureFollowerCatchUpSealGrace)
+}
+
+// parseEnvDurationNs reads a Go duration string into ns, treating absent, unparsable and
+// non-positive alike as 0.
+func parseEnvDurationNs(env string) int64 {
+	raw, exists := os.LookupEnv(env)
 	if !exists {
 		return 0
 	}

@@ -2303,102 +2303,71 @@ func (r *raft) maybeStartCatchUp(m *pb.Message, pr *tracker.Progress) {
 	}
 
 	target, followerStart := r.raftLog.lastIndex(), pr.Match
-	if experiment.Config.IsMeasureFollowerCatchUpDebugEnabled {
-		info := r.catchUpDebugInfo(m.GetFrom(), target, followerStart, pr)
-		info.CommitStallNs = r.commitStallNs(time.Now().UnixNano())
-		cm.StartDebug(m.GetFrom(), target, followerStart, info)
-		return
-	}
-	cm.Start(m.GetFrom(), target, followerStart)
+	cm.Start(m.GetFrom(), target, followerStart, r.commitStallNs(time.Now().UnixNano()))
 }
 
-// NOTE (Gus): ends the recovery phase of the quorum-critical catch-up measurement for the
-// follower that sent m, if one is in flight. Called only from the branch where
-// maybeCommit() just returned true, so this is the earliest point at which a
-// pending client request could get a reply again. endNs is the instant that ack was
-// stepped, sampled by the caller before any recording I/O. The episode itself lives on to
-// keep timing the replication of its backlog.
+// NOTE (Gus): ends the recovery phase of every quorum-critical catch-up episode in flight for
+// the follower that sent m. Called only from the branch where maybeCommit() just returned true,
+// so this is the earliest point at which a pending client request could get a reply again, and
+// the only progress mutation in that branch is this follower's — so the acknowledgement that
+// restored quorum restored it for every episode of that follower still waiting on it, not just
+// for one. endNs is the instant that ack was stepped, sampled by the caller before any recording
+// I/O. The episodes themselves live on to keep timing the replication of their backlogs.
 func (r *raft) maybeEndCatchUpRecovery(m *pb.Message, pr *tracker.Progress, endNs int64) {
 	cm := experiment.Config.CatchUpMsr
 	if !experiment.Config.IsMeasureFollowerCatchUpEnabled || cm == nil {
 		return
 	}
-	// NOTE (Gus): only this follower's own quorum-critical measurement (if any)
-	// should be ended here — a commit crossing quorum for an untracked follower
-	// isn't a catch-up we started measuring.
-	target, ok := cm.Target(m.GetFrom())
-	if !ok {
+	// NOTE (Gus): only this follower's own measurements should be ended here — a commit
+	// crossing quorum for an untracked follower isn't a catch-up we started measuring.
+	if !cm.IsActive(m.GetFrom()) {
 		return
 	}
 
+	snap := r.catchUpSnapshot(m.GetFrom(), pr)
 	if experiment.Config.IsMeasureFollowerCatchUpDebugEnabled {
-		followerStart, _ := cm.FollowerStartIndex(m.GetFrom())
-		cm.EndRecoveryDebug(m.GetFrom(), endNs, r.catchUpDebugInfo(m.GetFrom(), target, followerStart, pr))
+		cm.EndRecoveryDebug(m.GetFrom(), endNs, snap)
 		return
 	}
-	cm.EndRecovery(m.GetFrom(), endNs)
+	cm.EndRecovery(m.GetFrom(), endNs, snap)
 }
 
-// NOTE (Gus): ends the replication phase of the catch-up measurement, timed from the same
-// instant as the recovery phase, once the follower replicated the whole backlog that had
-// piled up when its lag was detected. Convergence with the leader's current tip is
-// deliberately not the condition: under sustained load the tip keeps advancing and a
-// delayed follower never reaches it, so the target index snapshotted at Start is used.
-// endNs is the same instant handed to maybeEndCatchUpRecovery, so an ack that closes both
-// phases yields two identical durations rather than one inflated by the other's fsync.
+// NOTE (Gus): ends the replication phase of every catch-up episode whose backlog this
+// acknowledgement completed, each timed from its own start. Convergence with the leader's
+// current tip is deliberately not the condition: under sustained load the tip keeps advancing
+// and a delayed follower never reaches it, so each episode waits on the target index
+// snapshotted when it opened. endNs is the same instant handed to maybeEndCatchUpRecovery, so
+// an ack that closes both phases yields two identical durations rather than one inflated by
+// the other's fsync.
+//
+// Which episodes those are is the recorder's decision, not this function's: with several open
+// at once the caller has no single target to compare pr.Match against, which is why the
+// snapshot goes down whole and unconditionally — it carries pr.Match, and episodes short of
+// their target read it to remember how far the follower did get.
 func (r *raft) maybeEndCatchUpReplication(m *pb.Message, pr *tracker.Progress, endNs int64) {
 	cm := experiment.Config.CatchUpMsr
 	if !experiment.Config.IsMeasureFollowerCatchUpEnabled || cm == nil {
 		return
 	}
-	target, ok := cm.Target(m.GetFrom())
-	if !ok {
-		return
-	}
-	if pr.Match < target {
-		// NOTE (Gus): still short of the backlog. Hand the recorder the progress anyway —
-		// if this episode is later abandoned it has no end line to read the follower's
-		// state off of, and how far it did get is the whole point of that outcome.
-		cm.Observe(m.GetFrom(), pr.Match)
+	if !cm.IsActive(m.GetFrom()) {
 		return
 	}
 
+	snap := r.catchUpSnapshot(m.GetFrom(), pr)
 	if experiment.Config.IsMeasureFollowerCatchUpDebugEnabled {
-		followerStart, _ := cm.FollowerStartIndex(m.GetFrom())
-		cm.EndReplicationDebug(m.GetFrom(), endNs, r.catchUpDebugInfo(m.GetFrom(), target, followerStart, pr))
+		cm.EndReplicationDebug(m.GetFrom(), endNs, snap)
 		return
 	}
-	cm.EndReplication(m.GetFrom(), endNs)
+	cm.EndReplication(m.GetFrom(), endNs, snap)
 }
 
-// NOTE (Gus): snapshot of the leader and follower log state to append to a recorded
-// catch-up line when the debug config is on. LogEntries is the real backlog the follower
-// had to replicate to close this episode — target minus the follower's own last index at
-// detection time — not the leader's current log volume: a lagging-but-not-down follower
-// already held some entries, it wasn't starting from zero.
-//
-// AckedEntries is how far the follower actually got, and exists because LogEntries alone
-// turned out to overstate the work. A rejection only rewinds the leader's own bookkeeping
-// (pr.Match), and a follower that already holds the entries answers a probe landing below
-// its commit index with that commit index, so pr.Match can leap the whole backlog in one
-// round trip without a single entry moving. The v5 experiment data is full of such episodes:
-// 14169 "entries" closed in 183ms over a delayed link, which is far more than the single
-// 1MiB MsgApp a probing leader sends could carry. AckedEntries diverging from LogEntries is
-// the signature of that re-sync; the two agreeing is a catch-up that really shipped a log.
-func (r *raft) catchUpDebugInfo(id uint64, target uint64, followerStart uint64, pr *tracker.Progress) experiment.CatchUpDebugInfo {
-	var logEntries, acked uint64
-	if target >= followerStart {
-		logEntries = target - followerStart
-	}
-	if pr.Match >= followerStart {
-		acked = pr.Match - followerStart
-	}
-
-	return experiment.CatchUpDebugInfo{
+// NOTE (Gus): the leader and follower log state at the instant a phase closed. Nothing in it
+// depends on which episode is being closed, which is the point — one acknowledgement can close
+// several, and this function has no way to know how many. The per-episode fields of a recorded
+// line (logEntries, acked, target, commitStallNs) are derived by the recorder, from the episode.
+func (r *raft) catchUpSnapshot(id uint64, pr *tracker.Progress) experiment.CatchUpSnapshot {
+	return experiment.CatchUpSnapshot{
 		FollowerID:       id,
-		LogEntries:       logEntries,
-		AckedEntries:     acked,
-		TargetIndex:      target,
 		LeaderFirstIndex: r.raftLog.firstIndex(),
 		LeaderLastIndex:  r.raftLog.lastIndex(),
 		LeaderCommitted:  r.raftLog.committed,
