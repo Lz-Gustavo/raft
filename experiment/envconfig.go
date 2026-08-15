@@ -88,6 +88,14 @@ const (
 	// cluster information and members status on EtcdClusterStatusFilename.
 	EtcdClusterStatusEnabled  = "ETCD_CLUSTER_STATUS_ENABLED"
 	EtcdClusterStatusFilename = "ETCD_CLUSTER_STATUS_FILENAME"
+
+	// EtcdApplyLagEnabled enables a routine, launched on etcdserver, that periodically outputs
+	// the leader's committed/applied index gap on EtcdApplyLagFilename. This is the exact
+	// quantity EtcdDisableTooManyRequests's check gates on (committed - applied > 5000), and
+	// unlike the raft catch-up measurement it is observable even while the shed is rejecting
+	// proposals before they ever reach raft.
+	EtcdApplyLagEnabled  = "ETCD_MEASURE_APPLY_LAG_ENABLED"
+	EtcdApplyLagFilename = "ETCD_MEASURE_APPLY_LAG_FILENAME"
 )
 
 const (
@@ -95,6 +103,7 @@ const (
 	defaultFollowerCatchUpFilename   = "/tmp/follower-catchup-time.out"
 	defaultEtcdThroughputFilename    = "/tmp/etcd-throughput.out"
 	defaultEtcdClusterStatusFilename = "/tmp/etcd-cluster-status.out"
+	defaultEtcdApplyLagFilename      = "/tmp/etcd-apply-lag.out"
 )
 
 var Config = ExpConfig{}
@@ -120,6 +129,9 @@ type ExpConfig struct {
 
 	IsEtcdClusterStatusEnabled bool
 	EtcdClusterStatusFilename  string
+
+	IsEtcdApplyLagEnabled bool
+	EtcdApplyLagFilename  string
 }
 
 func LoadEnvConfig() {
@@ -184,6 +196,15 @@ func LoadEnvConfig() {
 			fn = defaultEtcdClusterStatusFilename
 		}
 		Config.EtcdClusterStatusFilename = fn
+	}
+
+	Config.IsEtcdApplyLagEnabled = parseEnvBool(EtcdApplyLagEnabled)
+	if Config.IsEtcdApplyLagEnabled {
+		fn, exists := os.LookupEnv(EtcdApplyLagFilename)
+		if !exists {
+			fn = defaultEtcdApplyLagFilename
+		}
+		Config.EtcdApplyLagFilename = fn
 	}
 }
 
