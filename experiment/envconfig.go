@@ -96,6 +96,14 @@ const (
 	// proposals before they ever reach raft.
 	EtcdApplyLagEnabled  = "ETCD_MEASURE_APPLY_LAG_ENABLED"
 	EtcdApplyLagFilename = "ETCD_MEASURE_APPLY_LAG_FILENAME"
+
+	// EtcdRaftMsgBatchSize overrides raft's MaxSizePerMsg, the byte ceiling on how much log the
+	// leader packs into each MsgApp. etcd hardcodes it at 1MiB, which makes the batch size
+	// invisible as an experimental variable even though it is the dominant term in how fast a
+	// lagging follower is fed during catch-up: the leader can have at most MaxInflightMsgs
+	// messages of this size in flight, so the batch sets the bandwidth-delay product the
+	// recovery runs at. Unset means the etcd default of 1MiB. 0 means exactly 1 entry per message.
+	EtcdRaftMsgBatchSize = "ETCD_RAFT_MSG_BATCH_SIZE"
 )
 
 const (
@@ -104,6 +112,8 @@ const (
 	defaultEtcdThroughputFilename    = "/tmp/etcd-throughput.out"
 	defaultEtcdClusterStatusFilename = "/tmp/etcd-cluster-status.out"
 	defaultEtcdApplyLagFilename      = "/tmp/etcd-apply-lag.out"
+
+	maxRaftMsgBatchSize = 4 * 1024 * 1024
 )
 
 var Config = ExpConfig{}
@@ -132,6 +142,9 @@ type ExpConfig struct {
 
 	IsEtcdApplyLagEnabled bool
 	EtcdApplyLagFilename  string
+
+	IsRaftMsgBatchSizeSet bool // 0 is a valid size, so it cannot mean unset
+	RaftMsgBatchSize      uint64
 }
 
 func LoadEnvConfig() {
@@ -206,6 +219,25 @@ func LoadEnvConfig() {
 		}
 		Config.EtcdApplyLagFilename = fn
 	}
+
+	Config.IsRaftMsgBatchSizeSet, Config.RaftMsgBatchSize = parseRaftMsgBatchSize()
+}
+
+// raftMsgBatchSize reports whether the knob is set, and its value.
+func parseRaftMsgBatchSize() (bool, uint64) {
+	raw, exists := os.LookupEnv(EtcdRaftMsgBatchSize)
+	if !exists || raw == "" {
+		return false, 0
+	}
+
+	val, err := strconv.ParseUint(raw, 10, 64)
+	if err != nil || val >= maxRaftMsgBatchSize {
+		log.Fatalf(
+			"invalid %s=%q: want a plain byte count in [0, %d)",
+			EtcdRaftMsgBatchSize, raw, maxRaftMsgBatchSize,
+		)
+	}
+	return true, val
 }
 
 // NOTE (Gus): the configured arm instant, converted to the ns the measurement compares
